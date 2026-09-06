@@ -1,0 +1,55 @@
+name: fcitx5-wetypex
+arch: amd64
+platform: linux
+version: "@WETYPEX_VERSION@"
+section: utils
+priority: optional
+maintainer: WeTypeX contributors <https://github.com/panxuc/fcitx5-wetypex>
+description: WeTypeX native Linux input method for Fcitx5
+vendor: WeTypeX contributors
+homepage: https://github.com/panxuc/fcitx5-wetypex
+license: MIT
+scripts:
+  postinstall: "@WETYPEX_PROJECT_ROOT@/packaging/post-install.sh"
+contents:
+  - src: "@WETYPEX_STAGE@/"
+    dst: /
+    type: tree
+overrides:
+  deb:
+    depends:
+      - libc6
+      - libc++1
+      - libcurl4
+      - libjson-c5
+      - fcitx5
+      - libimecore0
+      - libimepinyin0
+      - libqt6widgets6
+      - libqt6network6
+      - libqt6dbus6
+      - libqt6svg6
+      - libqt6webenginewidgets6
+      - bubblewrap
+      - util-linux
+      - python3
+      - pipewire-bin
+      - ffmpeg
+      - wl-clipboard
+  rpm:
+    depends:
+      - glibc
+      - libcxx
+      - libcurl
+      - json-c
+      - fcitx5
+      - libime
+      - qt6-qtbase
+      - qt6-qtsvg
+      - qt6-qtwebengine
+      - bubblewrap
+      - util-linux
+      - python3
+      - pipewire-utils
+      - ffmpeg
+      - wl-clipboard

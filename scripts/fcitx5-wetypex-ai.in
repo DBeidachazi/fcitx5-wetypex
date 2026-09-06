@@ -1,0 +1,48 @@
+#!/bin/sh
+set -eu
+fetch_only=0
+requested_output=
+if [ "${1:-}" = --fetch ]; then
+  fetch_only=1
+  requested_output="$2"
+  shift 2
+fi
+question="$*"
+test -n "$question" || { echo 'usage: fcitx5-wetypex-ai QUESTION' >&2; exit 64; }
+data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
+runtime="${WETYPE_RUNTIME_DIR:-$data_home/fcitx5-wetypex/runtime}"
+account="${WETYPE_ACCOUNT_STATE_DIR:-$data_home/fcitx5-wetypex/account}"
+support="${WETYPE_SUPPORT_DIR:-@WETYPE_SUPPORT_DIR@}"
+state="${WETYPE_AI_STATE_DIR:-$data_home/fcitx5-wetypex/ai}"
+identity="$account/identity.json"
+test -f "$runtime/manifest.txt" -a -f "$identity" || { echo 'WeTypeX runtime or paired identity is missing.' >&2; exit 78; }
+mkdir -p "$state/user"
+chmod 700 "$state"
+uin="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["uin"])' "$identity")"
+device="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["device_code"])' "$identity")"
+raw="$state/response.raw"
+html="${requested_output:-$state/response.html}"
+timeout 50 bwrap --unshare-pid --die-with-parent \
+  --ro-bind /usr /usr --symlink usr/lib /lib --symlink usr/lib /lib64 --symlink usr/bin /bin \
+  --proc /proc --dev /dev --tmpfs /tmp --dir /etc \
+  --ro-bind /etc/resolv.conf /etc/resolv.conf --ro-bind /etc/hosts /etc/hosts \
+  --ro-bind /etc/nsswitch.conf /etc/nsswitch.conf --ro-bind /etc/ssl /etc/ssl \
+  --ro-bind /etc/ca-certificates /etc/ca-certificates \
+  --ro-bind "$runtime" /input --ro-bind "$support" /support --bind "$state" /work \
+  --chdir /work --clearenv --setenv PATH /usr/bin --setenv HOME /work \
+  --setenv WETYPE_SUPPORT_DIR /support --setenv WETYPE_NETWORK_LIVE 1 \
+  --setenv WETYPE_CORE_UIN "$uin" --setenv WETYPE_CORE_DEVICE_CODE "$device" \
+  --setenv WETYPE_DEVICE_MODEL "$(cat /sys/class/dmi/id/product_name 2>/dev/null || printf LINUX)" \
+  /support/wetypex-engine-host /input llm-service "$question" > "$raw" 2> "$state/last-ai.log"
+python3 - "$raw" "$html" <<'PY'
+import pathlib,sys
+raw=pathlib.Path(sys.argv[1]).read_text(errors='replace')
+start=raw.find('<!DOCTYPE html>');end=raw.find('\nLLM_RESULT',start)
+if start < 0 or end < 0: raise SystemExit('Official AI response did not contain a render document')
+pathlib.Path(sys.argv[2]).write_text(raw[start:end])
+PY
+chmod 600 "$raw" "$html" "$state/last-ai.log"
+if [ "$fetch_only" -eq 1 ]; then
+  exit 0
+fi
+exec @CMAKE_INSTALL_FULL_BINDIR@/fcitx5-wetypex-ai-viewer "$html" "$question"

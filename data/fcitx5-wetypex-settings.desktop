@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=WeTypeX Settings
+Name[zh_CN]=WeTypeX 设置
+Comment=WeTypeX input method settings
+Comment[zh_CN]=WeTypeX 输入法设置
+Exec=fcitx5-wetypex-settings
+Icon=fcitx5-wetypex
+Categories=Settings;Utility;
+StartupNotify=true

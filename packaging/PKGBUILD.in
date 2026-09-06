@@ -1,0 +1,29 @@
+pkgname=fcitx5-wetypex
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='WeTypeX native Linux input method for Fcitx5'
+url='https://github.com/panxuc/fcitx5-wetypex'
+arch=('x86_64')
+license=('MIT' 'ISC' 'BSD-2-Clause')
+depends=('fcitx5>=5.1.9' 'libime>=1.1.15' 'libc++' 'json-c' 'curl' 'bubblewrap' 'util-linux' 'python' 'qt6-base' 'qt6-svg' 'qt6-webengine' 'wl-clipboard' 'pipewire' 'ffmpeg')
+makedepends=('cmake' 'clang' 'git')
+optdepends=('fcitx5-configtool: manage input methods')
+source=("fcitx5-wetypex-${pkgver}.tar.gz"
+        'libkqueue::git+https://github.com/mheily/libkqueue.git#commit=46a3e130f88b0b0742575dcb01d77e336538024b')
+sha256sums=('@SOURCE_SHA256@' 'SKIP')
+
+build() {
+  cmake -S "${srcdir}/fcitx5-wetypex-${pkgver}" -B "${srcdir}/build" \
+    -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr \
+    -DCMAKE_INSTALL_LIBDIR=lib \
+    -DFETCHCONTENT_SOURCE_DIR_KQUEUE="${srcdir}/libkqueue"
+  cmake --build "${srcdir}/build" --parallel
+}
+
+package() {
+  DESTDIR="${pkgdir}" cmake --install "${srcdir}/build"
+  install -Dm644 "${srcdir}/fcitx5-wetypex-${pkgver}/LICENSE" \
+    "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+  install -Dm644 "${srcdir}/fcitx5-wetypex-${pkgver}/README.md" \
+    "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+}

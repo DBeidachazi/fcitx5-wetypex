@@ -1,0 +1,229 @@
+#!/bin/sh
+set -eu
+
+command_name="${1:-}"
+case "$command_name" in
+  pairing-code)
+    operation_name=WETYPE_PAIRING_CODE
+    operation_value=1
+    ;;
+  pairing-status)
+    operation_name=WETYPE_PAIRING_STATUS_CODE
+    operation_value="${2:-}"
+    case "$operation_value" in
+      *[!0-9]*|'') echo "pairing-status requires the 6-digit match code" >&2; exit 64 ;;
+    esac
+    test "${#operation_value}" -eq 6 || {
+      echo "pairing-status requires the 6-digit match code" >&2
+      exit 64
+    }
+    ;;
+  confirm-bind)
+    operation_name=WETYPE_CONFIRM_BIND_ID
+    operation_value="${2:-}"
+    test -n "$operation_value" || {
+      echo "confirm-bind requires the bind id returned by pairing-status" >&2
+      exit 64
+    }
+    ;;
+  group-info)
+    operation_name=WETYPE_GROUP_INFO
+    operation_value=1
+    ;;
+  set-functions)
+    operation_name=WETYPE_SET_FUNCTIONS
+    operation_value="${3:-}"
+    group_id="${2:-}"
+    case "$group_id:$operation_value" in
+      *[!0-9:]*|:*) echo "set-functions requires GROUP_ID and mask 0..7" >&2; exit 64 ;;
+    esac
+    test "$operation_value" -ge 0 -a "$operation_value" -le 7 || {
+      echo "set-functions mask must be 0..7" >&2; exit 64
+    }
+    ;;
+  send-clipboard)
+    operation_name=WETYPE_SEND_CLIPBOARD
+    operation_value="${3:-}"
+    group_id="${2:-}"
+    case "$group_id" in *[!0-9]*|'') echo "send-clipboard requires GROUP_ID and text" >&2; exit 64 ;; esac
+    test -n "$operation_value" || { echo "send-clipboard requires non-empty text" >&2; exit 64; }
+    test "${#operation_value}" -le 16384 || { echo "clipboard text is too large" >&2; exit 64; }
+    ;;
+  send-image)
+    operation_name=WETYPE_SEND_CLIPBOARD_IMAGE
+    operation_value=/work/business/clipboard-upload.bin
+    group_id="${2:-}"
+    image_source="${3:-}"
+    case "$group_id" in *[!0-9]*|'') echo "send-image requires GROUP_ID and PNG_FILE" >&2; exit 64 ;; esac
+    test -f "$image_source" || { echo "send-image requires a readable PNG file" >&2; exit 64; }
+    image_size="$(wc -c < "$image_source")"
+    test "$image_size" -gt 0 -a "$image_size" -le 8388608 || {
+      echo "clipboard image must be 1..8388608 bytes" >&2; exit 64
+    }
+    ;;
+  voice-file)
+    operation_name=WETYPE_VOICE_FILE
+    operation_value=/work/business/voice-input.opus
+    voice_source="${2:-}"
+    test -f "$voice_source" || { echo "voice-file requires an Opus file" >&2; exit 64; }
+    voice_size="$(wc -c < "$voice_source")"
+    test "$voice_size" -gt 0 -a "$voice_size" -le 8388608 || {
+      echo "voice file must be 1..8388608 bytes" >&2; exit 64
+    }
+    ;;
+  p2p-code)
+    operation_name=WETYPE_P2P_CODE
+    operation_value=1
+    ;;
+  p2p-peer)
+    operation_name=WETYPE_P2P_PEER
+    operation_value="${2:-}"
+    test -n "$operation_value" || { echo "p2p-peer requires a transfer code" >&2; exit 64; }
+    ;;
+  unbind)
+    operation_name=WETYPE_UNBIND_UIN
+    operation_value="${2:-}"
+    case "$operation_value" in *[!0-9]*|'') echo "unbind requires a device UIN" >&2; exit 64 ;; esac
+    ;;
+  *)
+    echo "usage: fcitx5-wetypex-account pairing-code | pairing-status CODE | confirm-bind BIND_ID | group-info | set-functions GROUP_ID MASK | send-clipboard GROUP_ID TEXT | send-image GROUP_ID PNG_FILE | voice-file OPUS_FILE | p2p-code | p2p-peer CODE | unbind UIN" >&2
+    exit 64
+    ;;
+esac
+
+runtime="${WETYPE_RUNTIME_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/fcitx5-wetypex/runtime}"
+state="${WETYPE_ACCOUNT_STATE_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/fcitx5-wetypex/account}"
+support="${WETYPE_SUPPORT_DIR:-@WETYPE_SUPPORT_DIR@}"
+test -f "$runtime/manifest.txt" || {
+  echo "Run fcitx5-wetypex-setup first." >&2
+  exit 78
+}
+mkdir -p "$state/business"
+chmod 700 "$state" "$state/business"
+if [ "$command_name" = send-image ]; then
+  cp "$image_source" "$state/business/clipboard-upload.bin"
+  chmod 600 "$state/business/clipboard-upload.bin"
+  trap 'rm -f "$state/business/clipboard-upload.bin"' EXIT
+fi
+if [ "$command_name" = voice-file ]; then
+  cp "$voice_source" "$state/business/voice-input.opus"
+  chmod 600 "$state/business/voice-input.opus"
+  trap 'rm -f "$state/business/voice-input.opus"' EXIT
+fi
+model="$(cat /sys/class/dmi/id/product_name 2>/dev/null || true)"
+test -n "$model" || model=LINUX
+
+log="$state/last-network.log"
+run_original() {
+  # Pairing, settings and background sync share the same original account
+  # database. Wait for the current short operation instead of surfacing an
+  # intermittent failure when two callers overlap.
+  flock -w 20 -E 73 "$state/account.lock" \
+    bwrap --unshare-pid --die-with-parent \
+      --ro-bind /usr /usr --symlink usr/lib /lib --symlink usr/lib /lib64 \
+      --symlink usr/bin /bin --proc /proc --dev /dev --tmpfs /tmp \
+      --dir /etc --ro-bind /etc/resolv.conf /etc/resolv.conf \
+      --ro-bind /etc/hosts /etc/hosts \
+      --ro-bind /etc/nsswitch.conf /etc/nsswitch.conf \
+      --ro-bind /etc/ssl /etc/ssl \
+      --ro-bind /etc/ca-certificates /etc/ca-certificates \
+      --ro-bind "$runtime" /input --ro-bind "$support" /support \
+      --bind "$state" /work --chdir /work --clearenv \
+      --setenv PATH /usr/bin --setenv HOME /work \
+      --setenv WETYPE_SUPPORT_DIR /support \
+      --setenv WETYPE_DEVICE_MODEL "$model" \
+      --setenv WETYPE_WORK_DIR /work/business \
+      --setenv WETYPE_IDENTITY_FILE /work/identity.json \
+      --setenv WETYPE_NETWORK_LIVE 1 \
+      --setenv WETYPE_GROUP_ID "${group_id:-0}" \
+      --setenv WETYPE_VOICE_POLISH "${WETYPE_VOICE_POLISH:-1}" \
+      --setenv "$operation_name" "$operation_value" \
+      /support/wetypex-engine-host /input business-service 2>"$log"
+}
+if ! output="$(run_original)"; then
+  chmod 600 "$log" 2>/dev/null || true
+  echo "Unable to initialize the original WeType account service. See $log" >&2
+  exit 1
+fi
+if [ "$command_name" = pairing-code ] && ! printf '%s\n' "$output" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+raise SystemExit(0 if data.get("pairing_error") == 0 and len(data.get("match_code", "")) == 6 else 1)
+'; then
+  # A newly issued UIN requires the original network context to restart once.
+  # The identity and encrypted original token files are already persisted.
+  output="$(run_original)"
+fi
+chmod 600 "$log" "$state/identity.json" 2>/dev/null || true
+printf '%s\n' "$output" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+command = sys.argv[1]
+transport_error = data.get("pairing_error", -1)
+if command == "pairing-code":
+    code = data.get("match_code", "")
+    result = {"ok": transport_error == 0 and len(code) == 6,
+              "match_code": code if transport_error == 0 else "",
+              "error": transport_error}
+elif command == "pairing-status":
+    status = data.get("status", -1)
+    result = {"ok": transport_error == 0 and status in (0, 1, 2, 3),
+              "status": status,
+              "status_name": {0:"waiting",1:"success",2:"cancelled",3:"timeout"}.get(status,"unknown"),
+              "bind_id": data.get("bind_id", ""),
+              "show_reconfirm": bool(data.get("show_reconfirm", False)),
+              "error": transport_error}
+elif command == "confirm-bind":
+    service_error = data.get("response_error_code", -1)
+    result = {"ok": transport_error == 0 and service_error == 0,
+              "group_id": data.get("group_id", 0),
+              "error": transport_error,
+              "service_error": service_error}
+elif command == "group-info":
+    service_error = data.get("response_error_code", -1)
+    result = {"ok": transport_error == 0 and service_error == 0,
+              "group_id": data.get("group_id", 0),
+              "func_switch": data.get("func_switch", 0),
+              "devices": data.get("devices", []),
+              "clipboard": data.get("clipboard", ""),
+              "clipboard_version": data.get("clipboard_version", 0),
+              "clipboard_type": data.get("clipboard_type", 0),
+              "clipboard_binary": data.get("clipboard_binary", ""),
+              "hotword_version": data.get("hotword_version", 0),
+              "error": transport_error, "service_error": service_error}
+elif command in ("send-clipboard", "send-image"):
+    service_error = data.get("response_error_code", -1)
+    result = {"ok": transport_error == 0 and service_error == 0,
+              "version": data.get("clipboard_version", 0),
+              "error": transport_error, "service_error": service_error}
+elif command == "voice-file":
+    text = data.get("voice_text", "")
+    result = {"ok": transport_error == 0 and bool(text),
+              "text": text,
+              "payload": data.get("voice_payload", ""),
+              "error": transport_error,
+              "response_bytes": data.get("pairing_response_bytes", 0)}
+elif command == "p2p-code":
+    service_error = data.get("response_error_code", -1)
+    code = data.get("transfer_code", "")
+    result = {"ok": transport_error == 0 and service_error == 0 and bool(code),
+              "transfer_code": code,
+              "transfer_url": data.get("transfer_url", ""),
+              "transfer_image": data.get("transfer_image", ""),
+              "expire_at": data.get("transfer_expire_at", 0),
+              "expiration": data.get("transfer_expiration", 0),
+              "error": transport_error, "service_error": service_error}
+elif command == "p2p-peer":
+    service_error = data.get("response_error_code", -1)
+    result = {"ok": transport_error == 0 and service_error == 0,
+              "peer": data.get("peer", {}),
+              "dispatch_buf": data.get("dispatch_buf", ""),
+              "peer_dispatch_buf": data.get("peer_dispatch_buf", ""),
+              "error": transport_error, "service_error": service_error}
+else:
+    service_error = data.get("response_error_code", -1)
+    result = {"ok": transport_error == 0 and service_error == 0,
+              "error": transport_error, "service_error": service_error}
+print(json.dumps(result, ensure_ascii=False))
+raise SystemExit(0 if result["ok"] else 1)
+' "$command_name"

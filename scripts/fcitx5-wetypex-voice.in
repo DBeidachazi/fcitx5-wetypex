@@ -1,0 +1,77 @@
+#!/bin/sh
+set -eu
+umask 077
+data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
+state="${WETYPE_STATE_DIR:-$data_home/fcitx5-wetypex/state}"
+mkdir -p "$state/voice"
+chmod 700 "$state" "$state/voice"
+control="$state/voice/recording"
+wav="$state/voice/input.wav"
+opus="$state/voice/input.opus"
+log="$state/voice/last-record.log"
+
+case "${1:-}" in
+  start)
+    if [ -f "$control" ]; then
+      old_pid="$(sed -n '1p' "$control")"
+      if kill -0 "$old_pid" 2>/dev/null; then exit 0; fi
+    fi
+    rm -f "$wav" "$opus"
+    pw-record --rate 16000 --channels 1 --format s16 "$wav" >"$log" 2>&1 &
+    recorder=$!
+    printf '%s\n' "$recorder" > "$control"
+    chmod 600 "$control" "$log"
+    ;;
+  stop)
+    test -f "$control" || exit 0
+    recorder="$(sed -n '1p' "$control")"
+    case "$recorder" in *[!0-9]*|'') exit 1;; esac
+    kill -INT "$recorder" 2>/dev/null || true
+    count=0
+    while kill -0 "$recorder" 2>/dev/null && [ "$count" -lt 50 ]; do
+      sleep 0.1
+      count=$((count + 1))
+    done
+    if kill -0 "$recorder" 2>/dev/null; then
+      kill -TERM "$recorder" 2>/dev/null || true
+    fi
+    rm -f "$control"
+    test -s "$wav" || exit 1
+    ffmpeg -hide_banner -loglevel error -y -i "$wav" -ar 16000 -ac 1 \
+      -c:a libopus -application voip -frame_duration 20 "$opus"
+    config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
+    if [ -f "$config_home/fcitx5/wetypex.json" ]; then
+      WETYPE_VOICE_POLISH="$(python3 -c 'import json,sys;print(1 if json.load(open(sys.argv[1])).get("voice_smart_polish",True) else 0)' "$config_home/fcitx5/wetypex.json" 2>/dev/null || printf 1)"
+      export WETYPE_VOICE_POLISH
+    fi
+    output=
+    attempt=0
+    while [ "$attempt" -lt 10 ]; do
+      if output="$(@CMAKE_INSTALL_FULL_BINDIR@/fcitx5-wetypex-account voice-file "$opus")"; then
+        break
+      fi
+      attempt=$((attempt + 1))
+      sleep 0.3
+    done
+    test -n "$output" || exit 1
+    result="$state/voice/result.json"
+    printf '%s\n' "$output" > "$result"
+    chmod 600 "$result"
+    python3 - "$state/voice-inbox.json" "$result" <<'PY'
+import json, os, pathlib, sys, time
+data = json.load(open(sys.argv[2]))
+text = data.get("text", "") if data.get("ok") else ""
+if not text:
+    raise SystemExit(1)
+path = pathlib.Path(sys.argv[1])
+tmp = path.with_suffix(".tmp")
+tmp.write_text(json.dumps({"version": time.time_ns(), "text": text}, ensure_ascii=False) + "\n")
+os.chmod(tmp, 0o600)
+tmp.replace(path)
+PY
+    ;;
+  *)
+    echo 'usage: fcitx5-wetypex-voice start | stop' >&2
+    exit 64
+    ;;
+esac

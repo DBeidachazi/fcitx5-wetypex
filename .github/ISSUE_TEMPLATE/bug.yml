@@ -1,0 +1,38 @@
+name: 错误报告
+description: 报告可复现的 WeTypeX 问题
+title: "[Bug] "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: 请勿提交账户标识、设备码、匹配码、剪贴板或私人输入内容。
+  - type: input
+    id: version
+    attributes:
+      label: WeTypeX 版本
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: 系统与桌面环境
+      description: 发行版、Fcitx5、桌面、X11/Wayland
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期行为与实际行为
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 已脱敏日志
+      render: text

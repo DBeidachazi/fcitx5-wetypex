@@ -1,0 +1,17 @@
+name: 功能建议
+description: 建议新的 Linux 集成或兼容能力
+title: "[Feature] "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 使用场景
+      description: 请描述具体问题和期望行为。
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: 原版行为依据
+      description: 涉及界面或行为兼容时，请注明参考平台和版本。

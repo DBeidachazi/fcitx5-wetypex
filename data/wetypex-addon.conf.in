@@ -1,0 +1,9 @@
+[Addon]
+Name=WeTypeX
+Name[zh_CN]=WeTypeX 输入法
+Category=InputMethod
+Version=@PROJECT_VERSION@
+Library=wetypex
+Type=SharedLibrary
+OnDemand=False
+Configurable=True
