@@ -2,8 +2,10 @@
 // Unknown dependencies abort; they never silently return success.
 #define _GNU_SOURCE 1
 #include "../common/json.hpp"
-#include <atomic>
 #include <algorithm>
+#include <array>
+#include <arpa/inet.h>
+#include <atomic>
 #include <cctype>
 #include <cerrno>
 #include <cstdarg>
@@ -15,22 +17,34 @@
 #include <dirent.h>
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
-#include <map>
 #include <malloc.h>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <poll.h>
 #include <pthread.h>
+#include <semaphore.h>
+#include <set>
+#include <setjmp.h>
 #include <signal.h>
 #include <sstream>
 #include <string>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/random.h>
+#include <sys/select.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
+#include <sys/uio.h>
 #include <time.h>
 #include <ucontext.h>
 #include <unistd.h>
@@ -38,9 +52,795 @@
 
 static std::map<std::string, uintptr_t> syms;
 static std::vector<std::pair<uintptr_t, std::string>> address_names;
+static std::vector<std::pair<uintptr_t, uintptr_t>> mapped_image_ranges;
 static uintptr_t tls_data = 0, tls_size = 0, tls_total = 0;
 static uintptr_t stack_guard = 0xa35197bd82e436c1ULL;
 static bool service_mode = false;
+struct FlurryLocalCredentials {
+  const char *ca_cert, *client_key, *client_cert;
+  const char *server_key, *server_cert, *server_name;
+};
+static bool flurry_credentials_ready = false;
+static std::string flurry_ca_cert, flurry_client_key, flurry_client_cert,
+    flurry_server_key, flurry_server_cert, flurry_server_name;
+static void flurry_credentials_callback(void *,
+                                        const FlurryLocalCredentials *value,
+                                        const char *error) {
+  if (!value || error) {
+    fprintf(stderr, "FLURRY_CREDENTIALS_ERROR %s\n", error ? error : "unknown");
+    return;
+  }
+  fprintf(stderr,
+          "FLURRY_CREDENTIALS_READY ca=%zu client_cert=%zu server_cert=%zu "
+          "server_name=%zu\n",
+          strlen(value->ca_cert), strlen(value->client_cert),
+          strlen(value->server_cert), strlen(value->server_name));
+  flurry_ca_cert = value->ca_cert;
+  flurry_client_key = value->client_key;
+  flurry_client_cert = value->client_cert;
+  flurry_server_key = value->server_key;
+  flurry_server_cert = value->server_cert;
+  flurry_server_name = value->server_name;
+  flurry_credentials_ready = true;
+}
+enum class FlurryStatusCode : int {
+  Ok = 0,
+  Canceled = 1,
+  FilesystemFailed = 2
+};
+enum class FlurryLogLevel : int {
+  Debug = 0,
+  Info = 1,
+  Warning = 2,
+  Error = 3,
+  Fatal = 4
+};
+enum class FlurryTaskEntryType : int { File = 0, Directory = 1 };
+struct FlurryTaskInfo {
+  const char *id;
+  const char *file_path;
+  size_t file_size;
+  FlurryTaskEntryType entry_type;
+};
+struct FlurryUploadFileInfo {
+  const char *file_path;
+  const char *relative_path;
+};
+struct FlurryUploadDirectoryInfo {
+  const char *directory_path;
+  const char *relative_path;
+};
+class FlurryUploadDelegate {
+public:
+  virtual ~FlurryUploadDelegate() = default;
+  virtual void OnReadFileError(const char *, FlurryStatusCode,
+                               const char *) = 0;
+  virtual void WillStartUploadTasks(const FlurryTaskInfo *, size_t) = 0;
+  virtual void OnUploadTaskDone(const FlurryTaskInfo &, FlurryStatusCode,
+                                const char *) = 0;
+  virtual void OnUploadTaskProgress(const FlurryTaskInfo &, size_t, size_t) = 0;
+};
+class FlurryDownloadDelegate {
+public:
+  virtual ~FlurryDownloadDelegate() = default;
+  virtual void WillStartDownloadTasks(const FlurryTaskInfo *, size_t) = 0;
+  virtual void OnDownloadTaskDone(const FlurryTaskInfo &, FlurryStatusCode,
+                                  const char *) = 0;
+  virtual void OnDownloadTaskProgress(const FlurryTaskInfo &, size_t,
+                                      size_t) = 0;
+};
+class FlurryMessageDelegate {
+public:
+  virtual ~FlurryMessageDelegate() = default;
+  virtual void OnMessage(const char *, size_t) = 0;
+  virtual void OnMessageSent(int, bool, const char *) = 0;
+};
+class FlurryLogger {
+public:
+  virtual ~FlurryLogger() = default;
+  virtual void Log(FlurryLogLevel, const char *) = 0;
+};
+class FlurryDelegate : public FlurryUploadDelegate,
+                       public FlurryDownloadDelegate,
+                       public FlurryMessageDelegate,
+                       public FlurryLogger {
+public:
+  ~FlurryDelegate() override = default;
+  virtual void OnClientConnected() = 0;
+  virtual void OnPeerDisconnected() = 0;
+};
+class FlurryWXP2PDelegate : public FlurryUploadDelegate,
+                            public FlurryDownloadDelegate,
+                            public FlurryMessageDelegate,
+                            public FlurryLogger {
+public:
+  ~FlurryWXP2PDelegate() override = default;
+  // Keep these declarations on the intermediate interface.  Clang places
+  // them immediately after IFlurryUploadDelegate's slots, exactly as in the
+  // upstream IFlurryWXP2PDelegate ABI. Declaring them only on the final class
+  // moves them behind the other inherited interfaces and misroutes callbacks.
+  virtual void OnConnected(int type) = 0;
+  virtual void OnConnectBroken(int error) = 0;
+  virtual void OnConnectEndInfo(uint64_t room, const char *report,
+                                size_t length) = 0;
+};
+
+enum WXP2PTransferEvent {
+  WXP2PNone = 0,
+  WXP2PConnected = 1,
+  WXP2PSendReady = 2,
+  WXP2PSendResult = 3,
+  WXP2PBroken = 4,
+  WXP2PConnectEnd = 5,
+};
+class WXP2PTransferCallback {
+public:
+  virtual ~WXP2PTransferCallback() = default;
+  virtual int OnRecvData(const unsigned char *, int, int) = 0;
+  virtual int OnP2PEvent(WXP2PTransferEvent, int, void *, int) = 0;
+  virtual void OnWriteLog(int, const char *, int, const char *, const char *,
+                          unsigned) {}
+};
+class WXP2PTransfer {
+public:
+  virtual ~WXP2PTransfer() = default;
+  virtual int StartSession() = 0;
+  virtual int StopSession() = 0;
+  virtual int SendData(const unsigned char *, int, int, int) = 0;
+};
+class WXP2PProbeCallback final : public WXP2PTransferCallback {
+public:
+  std::atomic<bool> connected{false}, ended{false};
+  int OnRecvData(const unsigned char *, int length, int chunk) override {
+    fprintf(stdout, "{\"event\":\"wxp2p_data\",\"length\":%d,\"chunk\":%d}\n",
+            length, chunk);
+    fflush(stdout);
+    return 0;
+  }
+  int OnP2PEvent(WXP2PTransferEvent event, int error, void *data,
+                 int length) override {
+    int mode = 0;
+    if (event == WXP2PConnected && data && length >= int(sizeof(mode)))
+      memcpy(&mode, data, sizeof(mode));
+    if (event == WXP2PConnected)
+      connected = error == 0;
+    if (event == WXP2PBroken || event == WXP2PConnectEnd)
+      ended = true;
+    fprintf(stdout,
+            "{\"event\":\"wxp2p_status\",\"type\":%d,\"error\":%d,"
+            "\"mode\":%d,\"bytes\":%d}\n",
+            int(event), error, mode, length);
+    fflush(stdout);
+    return 0;
+  }
+  void OnWriteLog(int level, const char *file, int line, const char *function,
+                  const char *data, unsigned length) override {
+    if (getenv("WETYPE_HOST_DEBUG"))
+      fprintf(stderr, "WXP2P[%d] %s:%d %s %.*s\n", level, file ? file : "",
+              line, function ? function : "", int(length), data ? data : "");
+  }
+};
+
+static int run_wxp2p_probe() {
+  const char *path = getenv("WETYPE_WXP2P_DISPATCH_FILE");
+  if (!path || !*path)
+    return 2;
+  std::ifstream input(path, std::ios::binary);
+  std::string dispatch((std::istreambuf_iterator<char>(input)), {});
+  if (dispatch.empty() || dispatch.size() > 1048576)
+    return 2;
+  std::vector<unsigned char> config;
+  auto appendVarint = [&](uint64_t value) {
+    do {
+      unsigned char byte = value & 0x7f;
+      value >>= 7;
+      config.push_back(byte | (value ? 0x80 : 0));
+    } while (value);
+  };
+  appendVarint(0x0a);
+  appendVarint(dispatch.size());
+  config.insert(config.end(), dispatch.begin(), dispatch.end());
+  using Create =
+      WXP2PTransfer *(*)(WXP2PTransferCallback *, const unsigned char *, int);
+  auto create = reinterpret_cast<Create>(syms.at(
+      "__ZN13wxp2ptransfer19CreateWXP2PTransferEPNS_22IWXP2PTransferCallbackE"
+      "PKhi"));
+  WXP2PProbeCallback callback;
+  auto *session = create(&callback, config.data(), int(config.size()));
+  if (!session) {
+    fputs("WXP2P create failed\n", stderr);
+    return 2;
+  }
+  int started = session->StartSession();
+  fprintf(stdout, "{\"event\":\"wxp2p_started\",\"result\":%d}\n", started);
+  fflush(stdout);
+  for (unsigned i = 0; i < 600 && !callback.connected && !callback.ended; ++i)
+    usleep(50000);
+  session->StopSession();
+  delete session;
+  return callback.connected ? 0 : 3;
+}
+class FlurryTestDelegate final : public FlurryDelegate {
+public:
+  std::atomic<bool> connected{false}, received{false}, sent{false};
+  std::string message;
+  void OnReadFileError(const char *, FlurryStatusCode, const char *) override {}
+  void WillStartUploadTasks(const FlurryTaskInfo *, size_t) override {}
+  void OnUploadTaskDone(const FlurryTaskInfo &, FlurryStatusCode,
+                        const char *) override {}
+  void OnUploadTaskProgress(const FlurryTaskInfo &, size_t, size_t) override {}
+  void WillStartDownloadTasks(const FlurryTaskInfo *, size_t) override {}
+  void OnDownloadTaskDone(const FlurryTaskInfo &, FlurryStatusCode,
+                          const char *) override {}
+  void OnDownloadTaskProgress(const FlurryTaskInfo &, size_t, size_t) override {
+  }
+  void OnMessage(const char *data, size_t size) override {
+    message.assign(data, size);
+    received = true;
+  }
+  void OnMessageSent(int, bool success, const char *) override {
+    sent = success;
+  }
+  void Log(FlurryLogLevel level, const char *text) override {
+    if (getenv("WETYPE_HOST_DEBUG"))
+      fprintf(stderr, "FLURRY[%d] %s\n", int(level), text ? text : "");
+  }
+  void OnClientConnected() override { connected = true; }
+  void OnPeerDisconnected() override { connected = false; }
+};
+static std::mutex flurry_event_lock;
+static void emit_flurry_event(const char *type, const char *path = nullptr,
+                              size_t transferred = 0, size_t total = 0,
+                              int status = 0, const char *error = nullptr) {
+  auto event = wire::object();
+  wire::put(event.get(), "event", type);
+  if (path)
+    wire::put(event.get(), "path", path);
+  wire::put(event.get(), "transferred", int64_t(transferred));
+  wire::put(event.get(), "total", int64_t(total));
+  wire::put(event.get(), "status", int64_t(status));
+  if (error)
+    wire::put(event.get(), "error", error);
+  std::lock_guard lock(flurry_event_lock);
+  puts(wire::dump(event.get()).c_str());
+  fflush(stdout);
+}
+static void emit_flurry_grpc_ready(unsigned port) {
+  auto event = wire::object();
+  wire::put(event.get(), "event", "grpc_ready");
+  wire::put(event.get(), "port", int64_t(port));
+  wire::put(event.get(), "ca_cert", flurry_ca_cert);
+  wire::put(event.get(), "server_name", flurry_server_name);
+  std::lock_guard lock(flurry_event_lock);
+  puts(wire::dump(event.get()).c_str());
+  fflush(stdout);
+}
+class FlurryLiveDelegate final : public FlurryDelegate {
+public:
+  std::atomic<bool> connected{false};
+  void OnReadFileError(const char *path, FlurryStatusCode status,
+                       const char *error) override {
+    emit_flurry_event("read_error", path, 0, 0, int(status), error);
+  }
+  void WillStartUploadTasks(const FlurryTaskInfo *tasks,
+                            size_t count) override {
+    emit_flurry_event("upload_start",
+                      count && tasks ? tasks[0].file_path : nullptr, 0, count);
+  }
+  void OnUploadTaskDone(const FlurryTaskInfo &task, FlurryStatusCode status,
+                        const char *error) override {
+    emit_flurry_event("upload_done", task.file_path, task.file_size,
+                      task.file_size, int(status), error);
+  }
+  void OnUploadTaskProgress(const FlurryTaskInfo &task, size_t sent,
+                            size_t total) override {
+    emit_flurry_event("upload_progress", task.file_path, sent, total);
+  }
+  void WillStartDownloadTasks(const FlurryTaskInfo *tasks,
+                              size_t count) override {
+    emit_flurry_event("download_start",
+                      count && tasks ? tasks[0].file_path : nullptr, 0, count);
+  }
+  void OnDownloadTaskDone(const FlurryTaskInfo &task, FlurryStatusCode status,
+                          const char *error) override {
+    emit_flurry_event("download_done", task.file_path, task.file_size,
+                      task.file_size, int(status), error);
+  }
+  void OnDownloadTaskProgress(const FlurryTaskInfo &task, size_t written,
+                              size_t total) override {
+    emit_flurry_event("download_progress", task.file_path, written, total);
+  }
+  void OnMessage(const char *, size_t size) override {
+    emit_flurry_event("message", nullptr, size, size);
+  }
+  void OnMessageSent(int id, bool success, const char *error) override {
+    emit_flurry_event("message_sent", nullptr, id, id, success ? 0 : 1, error);
+  }
+  void Log(FlurryLogLevel level, const char *text) override {
+    if (getenv("WETYPE_HOST_DEBUG"))
+      fprintf(stderr, "FLURRY[%d] %s\n", int(level), text ? text : "");
+  }
+  void OnClientConnected() override {
+    connected = true;
+    emit_flurry_event("connected");
+  }
+  void OnPeerDisconnected() override {
+    connected = false;
+    emit_flurry_event("disconnected");
+  }
+};
+class FlurryWXP2PLiveDelegate final : public FlurryWXP2PDelegate {
+public:
+  std::atomic<bool> connected{false};
+  void OnReadFileError(const char *path, FlurryStatusCode status,
+                       const char *error) override {
+    emit_flurry_event("read_error", path, 0, 0, int(status), error);
+  }
+  void WillStartUploadTasks(const FlurryTaskInfo *tasks,
+                            size_t count) override {
+    emit_flurry_event("upload_start",
+                      count && tasks ? tasks[0].file_path : nullptr, 0, count);
+  }
+  void OnUploadTaskDone(const FlurryTaskInfo &task, FlurryStatusCode status,
+                        const char *error) override {
+    emit_flurry_event("upload_done", task.file_path, task.file_size,
+                      task.file_size, int(status), error);
+  }
+  void OnUploadTaskProgress(const FlurryTaskInfo &task, size_t sent,
+                            size_t total) override {
+    emit_flurry_event("upload_progress", task.file_path, sent, total);
+  }
+  void WillStartDownloadTasks(const FlurryTaskInfo *tasks,
+                              size_t count) override {
+    emit_flurry_event("download_start",
+                      count && tasks ? tasks[0].file_path : nullptr, 0, count);
+  }
+  void OnDownloadTaskDone(const FlurryTaskInfo &task, FlurryStatusCode status,
+                          const char *error) override {
+    emit_flurry_event("download_done", task.file_path, task.file_size,
+                      task.file_size, int(status), error);
+  }
+  void OnDownloadTaskProgress(const FlurryTaskInfo &task, size_t written,
+                              size_t total) override {
+    emit_flurry_event("download_progress", task.file_path, written, total);
+  }
+  void OnMessage(const char *, size_t size) override {
+    emit_flurry_event("message", nullptr, size, size);
+  }
+  void OnMessageSent(int id, bool success, const char *error) override {
+    emit_flurry_event("message_sent", nullptr, id, id, success ? 0 : 1, error);
+  }
+  void Log(FlurryLogLevel level, const char *text) override {
+    if (getenv("WETYPE_HOST_DEBUG"))
+      fprintf(stderr, "FLURRY_WXP2P[%d] %s\n", int(level), text ? text : "");
+  }
+  void OnConnected(int type) override {
+    connected = true;
+    emit_flurry_event("connected", nullptr, type, type);
+  }
+  void OnConnectBroken(int error) override {
+    connected = false;
+    emit_flurry_event("disconnected", nullptr, 0, 0, error);
+  }
+  void OnConnectEndInfo(uint64_t room, const char *, size_t length) override {
+    emit_flurry_event("connect_end", nullptr, room, length);
+  }
+};
+struct FlurryGrpcCredentials {
+  const char *local_cert;
+  const char *local_key;
+  const char *remote_ca_cert;
+  const char *server_name;
+};
+static bool run_flurry_loopback_test() {
+  char server_download[] = "/tmp/wetypex-flurry-server.XXXXXX";
+  char client_download[] = "/tmp/wetypex-flurry-client.XXXXXX";
+  if (!mkdtemp(server_download) || !mkdtemp(client_download))
+    return false;
+  std::string server_temp = std::string(server_download) + "/.parts";
+  std::string client_temp = std::string(client_download) + "/.parts";
+  mkdir(server_temp.c_str(), 0700);
+  mkdir(client_temp.c_str(), 0700);
+
+  int probe = socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  sockaddr_in6 address{};
+  address.sin6_family = AF_INET6;
+  address.sin6_addr = in6addr_any;
+  address.sin6_port = 0;
+  socklen_t address_size = sizeof(address);
+  if (probe < 0 ||
+      bind(probe, reinterpret_cast<sockaddr *>(&address), sizeof(address)) ||
+      getsockname(probe, reinterpret_cast<sockaddr *>(&address),
+                  &address_size)) {
+    if (probe >= 0)
+      close(probe);
+    return false;
+  }
+  const unsigned port = ntohs(address.sin6_port);
+  close(probe);
+
+  using Constructor =
+      void (*)(void *, const char *, const char *, FlurryDelegate *, int);
+  using StartServer =
+      bool (*)(void *, const char *, const FlurryGrpcCredentials &);
+  using Connect =
+      bool (*)(void *, const char *, const FlurryGrpcCredentials &, int);
+  using SendMessage = void (*)(void *, int, const char *, size_t);
+  auto constructor = reinterpret_cast<Constructor>(
+      syms.at("__ZN6flurry6FlurryC1EPKcS2_PNS_15IFlurryDelegateENS_"
+              "14PeerAckSupportE"));
+  auto start_server = reinterpret_cast<StartServer>(
+      syms.at("__ZN6flurry6Flurry11StartServerEPKcRKNS_15GrpcCredentialsE"));
+  auto connect = reinterpret_cast<Connect>(
+      syms.at("__ZN6flurry6Flurry7ConnectEPKcRKNS_15GrpcCredentialsEi"));
+  auto send_message = reinterpret_cast<SendMessage>(
+      syms.at("__ZN6flurry6Flurry11SendMessageEiPKcm"));
+
+  FlurryTestDelegate server_delegate, client_delegate;
+  alignas(16) unsigned char server[32]{}, client[32]{};
+  constructor(server, server_download, server_temp.c_str(), &server_delegate,
+              0);
+  constructor(client, client_download, client_temp.c_str(), &client_delegate,
+              0);
+  FlurryGrpcCredentials server_credentials{flurry_server_cert.c_str(),
+                                           flurry_server_key.c_str(),
+                                           flurry_ca_cert.c_str(), nullptr};
+  FlurryGrpcCredentials client_credentials{
+      flurry_client_cert.c_str(), flurry_client_key.c_str(),
+      flurry_ca_cert.c_str(), flurry_server_name.c_str()};
+  std::string listen = "[::]:" + std::to_string(port);
+  std::string destination = "127.0.0.1:" + std::to_string(port);
+  bool started = start_server(server, listen.c_str(), server_credentials);
+  bool connected =
+      started && connect(client, destination.c_str(), client_credentials, 5);
+  static const char message[] = "wetypex-flurry-loopback";
+  if (connected)
+    send_message(client, 1, message, sizeof(message) - 1);
+  for (unsigned i = 0;
+       i < 100 && !(client_delegate.sent && server_delegate.received); ++i)
+    usleep(20000);
+  const bool passed = connected && client_delegate.sent &&
+                      server_delegate.received &&
+                      server_delegate.message == message;
+  fprintf(stderr,
+          "FLURRY_LOOPBACK server=%d connected=%d sent=%d received=%d\n",
+          started, connected, bool(client_delegate.sent),
+          bool(server_delegate.received));
+  // The library requires destruction to happen asynchronously after its
+  // disconnect callback. The loopback verifier exits immediately below, so
+  // the operating system owns final teardown of the two short-lived peers.
+  return passed;
+}
+static int run_flurry_server() {
+  const char *download = getenv("WETYPE_FLURRY_DOWNLOAD_DIR");
+  const char *temporary = getenv("WETYPE_FLURRY_TEMP_DIR");
+  if (!download || !*download || !temporary || !*temporary) {
+    fputs("flurry-server requires download and temporary directories\n",
+          stderr);
+    return 2;
+  }
+  mkdir(download, 0700);
+  mkdir(temporary, 0700);
+  int probe = socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  sockaddr_in6 address{};
+  address.sin6_family = AF_INET6;
+  address.sin6_addr = in6addr_any;
+  socklen_t address_size = sizeof(address);
+  if (probe < 0 ||
+      bind(probe, reinterpret_cast<sockaddr *>(&address), sizeof(address)) ||
+      getsockname(probe, reinterpret_cast<sockaddr *>(&address),
+                  &address_size)) {
+    if (probe >= 0)
+      close(probe);
+    return 2;
+  }
+  const unsigned port = ntohs(address.sin6_port);
+  close(probe);
+  using Constructor =
+      void (*)(void *, const char *, const char *, FlurryDelegate *, int);
+  using StartServer =
+      bool (*)(void *, const char *, const FlurryGrpcCredentials &);
+  using Connect =
+      bool (*)(void *, const char *, const FlurryGrpcCredentials &, int);
+  using UploadFiles = void (*)(void *, const FlurryUploadFileInfo *, size_t);
+  using UploadEntries = void (*)(void *, const FlurryUploadFileInfo *, size_t,
+                                 const FlurryUploadDirectoryInfo *, size_t);
+  auto constructor = reinterpret_cast<Constructor>(
+      syms.at("__ZN6flurry6FlurryC1EPKcS2_PNS_15IFlurryDelegateENS_"
+              "14PeerAckSupportE"));
+  auto start_server = reinterpret_cast<StartServer>(
+      syms.at("__ZN6flurry6Flurry11StartServerEPKcRKNS_15GrpcCredentialsE"));
+  auto connect_peer = reinterpret_cast<Connect>(
+      syms.at("__ZN6flurry6Flurry7ConnectEPKcRKNS_15GrpcCredentialsEi"));
+  auto upload_files = reinterpret_cast<UploadFiles>(
+      syms.at("__ZN6flurry6Flurry11UploadFilesEPKNS_14UploadFileInfoEm"));
+  auto upload_entries = reinterpret_cast<UploadEntries>(
+      syms.at("__ZN6flurry6Flurry13UploadEntriesEPKNS_14UploadFileInfoEmPKNS_"
+              "19UploadDirectoryInfoEm"));
+  FlurryLiveDelegate delegate;
+  alignas(16) unsigned char server[32]{};
+  constructor(server, download, temporary, &delegate, 0);
+  auto ready = wire::object();
+  wire::put(ready.get(), "event", "ready");
+  wire::put(ready.get(), "port", int64_t(port));
+  wire::put(ready.get(), "ca_cert", flurry_ca_cert);
+  wire::put(ready.get(), "server_name", flurry_server_name);
+  puts(wire::dump(ready.get()).c_str());
+  fflush(stdout);
+  if (const char *ready_path = getenv("WETYPE_FLURRY_READY_FILE")) {
+    std::ofstream output(ready_path, std::ios::trunc);
+    output << wire::dump(ready.get()) << '\n';
+  }
+  std::string command;
+  if (!std::getline(std::cin, command))
+    return 2;
+  auto role = wire::parse(command);
+  const auto action = wire::str(role.get(), "action");
+  const auto remote_ca_file = wire::str(role.get(), "remote_ca_file");
+  std::ifstream remote_ca_stream(remote_ca_file);
+  std::string remote_ca((std::istreambuf_iterator<char>(remote_ca_stream)), {});
+  bool role_started = false;
+  if (action == "server" && !remote_ca.empty()) {
+    FlurryGrpcCredentials credentials{flurry_server_cert.c_str(),
+                                      flurry_server_key.c_str(),
+                                      remote_ca.c_str(), nullptr};
+    std::string listen = "[::]:" + std::to_string(port);
+    role_started = start_server(server, listen.c_str(), credentials);
+  } else if (action == "connect" && !remote_ca.empty()) {
+    const auto destination = wire::str(role.get(), "server_addr");
+    const auto remote_server_name = wire::str(role.get(), "server_name");
+    if (!destination.empty() && !remote_server_name.empty()) {
+      FlurryGrpcCredentials credentials{
+          flurry_client_cert.c_str(), flurry_client_key.c_str(),
+          remote_ca.c_str(), remote_server_name.c_str()};
+      role_started = connect_peer(server, destination.c_str(), credentials, 10);
+    }
+  }
+  if (!role_started) {
+    emit_flurry_event("start_failed");
+    return 2;
+  }
+  emit_flurry_event("role_started");
+  while (std::getline(std::cin, command)) {
+    auto request = wire::parse(command);
+    const auto request_action = wire::str(request.get(), "action");
+    if (request_action == "quit")
+      _exit(0);
+    if (request_action != "upload" && request_action != "upload_directory")
+      continue;
+    const auto path = wire::str(request.get(), "path");
+    struct stat file_status{};
+    if (path.empty() || stat(path.c_str(), &file_status) ||
+        (request_action == "upload" ? !S_ISREG(file_status.st_mode)
+                                    : !S_ISDIR(file_status.st_mode))) {
+      emit_flurry_event("read_error", path.c_str(), 0, 0,
+                        int(FlurryStatusCode::FilesystemFailed),
+                        "file does not exist");
+      continue;
+    }
+    if (request_action == "upload") {
+      FlurryUploadFileInfo file{path.c_str(), nullptr};
+      upload_files(server, &file, 1);
+      continue;
+    }
+    std::filesystem::path root(path);
+    const auto root_name = root.filename().string();
+    std::vector<std::string> file_paths, file_relatives, directory_paths,
+        directory_relatives;
+    directory_paths.push_back(root.string());
+    directory_relatives.push_back(root_name);
+    std::error_code traversal_error;
+    for (std::filesystem::recursive_directory_iterator
+             iterator(root, traversal_error),
+         end;
+         !traversal_error && iterator != end;
+         iterator.increment(traversal_error)) {
+      auto relative =
+          (std::filesystem::path(root_name) /
+           std::filesystem::relative(iterator->path(), root, traversal_error))
+              .generic_string();
+      if (traversal_error)
+        break;
+      if (iterator->is_directory()) {
+        directory_paths.push_back(iterator->path().string());
+        directory_relatives.push_back(std::move(relative));
+      } else if (iterator->is_regular_file()) {
+        file_paths.push_back(iterator->path().string());
+        file_relatives.push_back(std::move(relative));
+      }
+    }
+    if (traversal_error) {
+      emit_flurry_event("read_error", path.c_str(), 0, 0,
+                        int(FlurryStatusCode::FilesystemFailed),
+                        traversal_error.message().c_str());
+      continue;
+    }
+    std::vector<FlurryUploadFileInfo> files;
+    std::vector<FlurryUploadDirectoryInfo> directories;
+    for (size_t i = 0; i < file_paths.size(); ++i)
+      files.push_back({file_paths[i].c_str(), file_relatives[i].c_str()});
+    for (size_t i = 0; i < directory_paths.size(); ++i)
+      directories.push_back(
+          {directory_paths[i].c_str(), directory_relatives[i].c_str()});
+    upload_entries(server, files.data(), files.size(), directories.data(),
+                   directories.size());
+  }
+  _exit(0);
+}
+static int run_flurry_wxp2p_server() {
+  const char *download = getenv("WETYPE_FLURRY_DOWNLOAD_DIR");
+  const char *temporary = getenv("WETYPE_FLURRY_TEMP_DIR");
+  if (!download || !*download || !temporary || !*temporary)
+    return 2;
+  mkdir(download, 0700);
+  mkdir(temporary, 0700);
+  using Constructor = void (*)(void *, const char *, const char *,
+                               FlurryWXP2PLiveDelegate *, const char *, size_t);
+  using GrpcConstructor =
+      void (*)(void *, const char *, const char *, FlurryDelegate *, int);
+  using StartServer =
+      bool (*)(void *, const char *, const FlurryGrpcCredentials &);
+  using UploadFiles = void (*)(void *, const FlurryUploadFileInfo *, size_t);
+  using UploadEntries = void (*)(void *, const FlurryUploadFileInfo *, size_t,
+                                 const FlurryUploadDirectoryInfo *, size_t);
+  auto constructor = reinterpret_cast<Constructor>(
+      syms.at("__ZN6flurry11FlurryWXP2PC1EPKcS2_PNS_20IFlurryWXP2PDelegateES2_"
+              "m"));
+  auto uploadFiles = reinterpret_cast<UploadFiles>(
+      syms.at("__ZN6flurry11FlurryWXP2P11UploadFilesEPKNS_14UploadFileInfoEm"));
+  auto uploadEntries = reinterpret_cast<UploadEntries>(syms.at(
+      "__ZN6flurry11FlurryWXP2P13UploadEntriesEPKNS_14UploadFileInfoEmPKNS_"
+      "19UploadDirectoryInfoEm"));
+  auto grpcConstructor = reinterpret_cast<GrpcConstructor>(
+      syms.at("__ZN6flurry6FlurryC1EPKcS2_PNS_15IFlurryDelegateENS_"
+              "14PeerAckSupportE"));
+  auto startServer = reinterpret_cast<StartServer>(
+      syms.at("__ZN6flurry6Flurry11StartServerEPKcRKNS_15GrpcCredentialsE"));
+  FlurryWXP2PLiveDelegate delegate;
+  FlurryLiveDelegate grpcDelegate;
+  alignas(16) unsigned char session[32]{};
+  alignas(16) unsigned char grpcServer[32]{};
+  std::string dispatchPath = getenv("WETYPE_WXP2P_DISPATCH_FILE")
+                                 ? getenv("WETYPE_WXP2P_DISPATCH_FILE")
+                                 : "";
+  std::string remoteCaPath = getenv("WETYPE_FLURRY_REMOTE_CA_FILE")
+                                 ? getenv("WETYPE_FLURRY_REMOTE_CA_FILE")
+                                 : "";
+  std::string pendingCommand;
+  if (dispatchPath.empty()) {
+    auto ready = wire::object();
+    wire::put(ready.get(), "event", "ready");
+    wire::put(ready.get(), "transport", "wxp2p");
+    wire::put(ready.get(), "ca_cert", flurry_ca_cert);
+    wire::put(ready.get(), "server_name", flurry_server_name);
+    puts(wire::dump(ready.get()).c_str());
+    fflush(stdout);
+    while (std::getline(std::cin, pendingCommand)) {
+      auto request = wire::parse(pendingCommand);
+      const auto action = wire::str(request.get(), "action");
+      if (action == "quit")
+        _exit(0);
+      if (action == "wxp2p_start") {
+        dispatchPath = wire::str(request.get(), "dispatch_path");
+        remoteCaPath = wire::str(request.get(), "remote_ca_file");
+        break;
+      }
+    }
+  }
+  std::ifstream dispatchInput(dispatchPath, std::ios::binary);
+  std::string dispatch((std::istreambuf_iterator<char>(dispatchInput)), {});
+  if (dispatch.empty() || dispatch.size() > 1048576) {
+    emit_flurry_event("start_failed", dispatchPath.c_str(), 0, 0, 2,
+                      "invalid WXP2P dispatch result");
+    return 2;
+  }
+  constructor(session, download, temporary, &delegate, dispatch.data(),
+              dispatch.size());
+  emit_flurry_event("role_started");
+  if (!remoteCaPath.empty()) {
+    std::ifstream remoteCaInput(remoteCaPath);
+    std::string remoteCa((std::istreambuf_iterator<char>(remoteCaInput)), {});
+    int probe = socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    sockaddr_in6 address{};
+    address.sin6_family = AF_INET6;
+    address.sin6_addr = in6addr_any;
+    socklen_t addressSize = sizeof(address);
+    bool serverReady = probe >= 0 &&
+                       !bind(probe, reinterpret_cast<sockaddr *>(&address),
+                             sizeof(address)) &&
+                       !getsockname(probe,
+                                    reinterpret_cast<sockaddr *>(&address),
+                                    &addressSize);
+    const unsigned port = serverReady ? ntohs(address.sin6_port) : 0;
+    if (probe >= 0)
+      close(probe);
+    if (serverReady && !remoteCa.empty()) {
+      // Current mobile clients advertise capability 0x2, which the upstream
+      // controller maps to PeerAckSupport::Supported. Without this, the file
+      // is saved locally but the sender never receives its completion ACK and
+      // reports a false failure.
+      grpcConstructor(grpcServer, download, temporary, &grpcDelegate, 1);
+      FlurryGrpcCredentials credentials{flurry_server_cert.c_str(),
+                                        flurry_server_key.c_str(),
+                                        remoteCa.c_str(), nullptr};
+      const std::string listen = "[::]:" + std::to_string(port);
+      serverReady = startServer(grpcServer, listen.c_str(), credentials);
+    } else {
+      serverReady = false;
+    }
+    if (serverReady)
+      emit_flurry_grpc_ready(port);
+    else
+      emit_flurry_event("grpc_start_failed", remoteCaPath.c_str(), 0, 0, 2,
+                        "unable to start Flurry server");
+  }
+  std::string command;
+  while (std::getline(std::cin, command)) {
+    auto request = wire::parse(command);
+    const auto action = wire::str(request.get(), "action");
+    if (action == "quit")
+      _exit(0);
+    if (action != "upload" && action != "upload_directory")
+      continue;
+    const auto path = wire::str(request.get(), "path");
+    struct stat fileStatus{};
+    if (path.empty() || stat(path.c_str(), &fileStatus) ||
+        (action == "upload" ? !S_ISREG(fileStatus.st_mode)
+                            : !S_ISDIR(fileStatus.st_mode))) {
+      emit_flurry_event("read_error", path.c_str(), 0, 0,
+                        int(FlurryStatusCode::FilesystemFailed),
+                        "file does not exist");
+      continue;
+    }
+    if (action == "upload") {
+      FlurryUploadFileInfo file{path.c_str(), nullptr};
+      uploadFiles(session, &file, 1);
+      continue;
+    }
+    std::filesystem::path root(path);
+    const auto rootName = root.filename().string();
+    std::vector<std::string> filePaths, fileRelatives, directoryPaths,
+        directoryRelatives;
+    directoryPaths.push_back(root.string());
+    directoryRelatives.push_back(rootName);
+    std::error_code traversalError;
+    for (std::filesystem::recursive_directory_iterator
+             iterator(root, traversalError),
+         end;
+         !traversalError && iterator != end;
+         iterator.increment(traversalError)) {
+      auto relative =
+          (std::filesystem::path(rootName) /
+           std::filesystem::relative(iterator->path(), root, traversalError))
+              .generic_string();
+      if (traversalError)
+        break;
+      if (iterator->is_directory()) {
+        directoryPaths.push_back(iterator->path().string());
+        directoryRelatives.push_back(std::move(relative));
+      } else if (iterator->is_regular_file()) {
+        filePaths.push_back(iterator->path().string());
+        fileRelatives.push_back(std::move(relative));
+      }
+    }
+    if (traversalError) {
+      emit_flurry_event("read_error", path.c_str(), 0, 0,
+                        int(FlurryStatusCode::FilesystemFailed),
+                        traversalError.message().c_str());
+      continue;
+    }
+    std::vector<FlurryUploadFileInfo> files;
+    std::vector<FlurryUploadDirectoryInfo> directories;
+    for (size_t i = 0; i < filePaths.size(); ++i)
+      files.push_back({filePaths[i].c_str(), fileRelatives[i].c_str()});
+    for (size_t i = 0; i < directoryPaths.size(); ++i)
+      directories.push_back(
+          {directoryPaths[i].c_str(), directoryRelatives[i].c_str()});
+    uploadEntries(session, files.data(), files.size(), directories.data(),
+                  directories.size());
+  }
+  _exit(0);
+}
 alignas(16) static unsigned char default_rune_locale[4096];
 static uint32_t rune_mask(int c) {
   uint32_t r = 0;
@@ -85,6 +885,60 @@ static pthread_mutex_t registry_lock = PTHREAD_MUTEX_INITIALIZER;
 static std::map<void *, pthread_mutex_t *> mutexes;
 static std::map<void *, pthread_cond_t *> conditions;
 static std::map<void *, pthread_rwlock_t *> rwlocks;
+static std::map<void *, pthread_attr_t *> thread_attributes;
+static pthread_attr_t *thread_attribute_for(void *value) {
+  auto found = thread_attributes.find(value);
+  return found == thread_attributes.end() ? nullptr : found->second;
+}
+extern "C" int shim_pthread_attr_init(void *value) {
+  auto *attribute = new pthread_attr_t;
+  int result = pthread_attr_init(attribute);
+  if (result) {
+    delete attribute;
+    return result;
+  }
+  pthread_mutex_lock(&registry_lock);
+  thread_attributes[value] = attribute;
+  pthread_mutex_unlock(&registry_lock);
+  return 0;
+}
+extern "C" int shim_pthread_attr_destroy(void *value) {
+  pthread_mutex_lock(&registry_lock);
+  auto *attribute = thread_attribute_for(value);
+  if (attribute)
+    thread_attributes.erase(value);
+  pthread_mutex_unlock(&registry_lock);
+  if (!attribute)
+    return EINVAL;
+  int result = pthread_attr_destroy(attribute);
+  delete attribute;
+  return result;
+}
+extern "C" int shim_pthread_attr_setdetachstate(void *value, int state) {
+  pthread_mutex_lock(&registry_lock);
+  auto *attribute = thread_attribute_for(value);
+  int result = attribute ? pthread_attr_setdetachstate(
+                               attribute, state == 2 ? PTHREAD_CREATE_DETACHED
+                                                     : PTHREAD_CREATE_JOINABLE)
+                         : EINVAL;
+  pthread_mutex_unlock(&registry_lock);
+  return result;
+}
+extern "C" int shim_pthread_attr_setstacksize(void *value, size_t size) {
+  pthread_mutex_lock(&registry_lock);
+  auto *attribute = thread_attribute_for(value);
+  int result = attribute ? pthread_attr_setstacksize(attribute, size) : EINVAL;
+  pthread_mutex_unlock(&registry_lock);
+  return result;
+}
+extern "C" int shim_pthread_create(pthread_t *thread, void *value,
+                                   void *(*start)(void *), void *argument) {
+  pthread_mutex_lock(&registry_lock);
+  auto *attribute = value ? thread_attribute_for(value) : nullptr;
+  int result = pthread_create(thread, attribute, start, argument);
+  pthread_mutex_unlock(&registry_lock);
+  return result;
+}
 static pthread_rwlock_t *rwlock_for(void *p) {
   pthread_mutex_lock(&registry_lock);
   auto &r = rwlocks[p];
@@ -213,8 +1067,14 @@ extern "C" int shim_cond_broadcast(void *p) {
 extern "C" int shim_cond_wait(void *p, void *m) {
   return pthread_cond_wait(condition_for(p), mutex_for(m));
 }
+static int darwin_pthread_result(int result) {
+  // pthread functions return errno values directly. Darwin's ETIMEDOUT is 60,
+  // while Linux uses 110; Abseil checks the numeric Darwin value.
+  return result == ETIMEDOUT ? 60 : result;
+}
 extern "C" int shim_cond_timedwait(void *p, void *m, const timespec *t) {
-  return pthread_cond_timedwait(condition_for(p), mutex_for(m), t);
+  return darwin_pthread_result(
+      pthread_cond_timedwait(condition_for(p), mutex_for(m), t));
 }
 extern "C" int shim_cond_relative(void *p, void *m, const timespec *t) {
   timespec abs;
@@ -245,6 +1105,47 @@ extern "C" void shim_cpp_cv_wait(void *p, void *lock) {
   int r = shim_cond_wait(p, *(void **)lock);
   if (r)
     _exit(86);
+}
+extern "C" void shim_cpp_cv_timed_wait(void *p, void *lock,
+                                       int64_t nanoseconds_since_epoch) {
+  timespec deadline{};
+  deadline.tv_sec = nanoseconds_since_epoch / 1000000000LL;
+  deadline.tv_nsec = nanoseconds_since_epoch % 1000000000LL;
+  int result = shim_cond_timedwait(p, *(void **)lock, &deadline);
+  if (result && result != 60)
+    _exit(86);
+}
+extern "C" bool shim_cpp_mutex_try_lock(void *p) {
+  return shim_mutex_trylock(p) == 0;
+}
+extern "C" void shim_promise_void_get_future(void *output, void *promise) {
+  // Flurry constructs libc++'s __assoc_sub_state inline with Darwin's static
+  // pthread signatures, then calls the dynamically imported get_future().
+  // Linux libc++ operates on the embedded native pthread objects directly.
+  // Convert those two fields before crossing that ABI boundary.
+  auto *state = promise ? *static_cast<void **>(promise) : nullptr;
+  if (state) {
+    auto *bytes = static_cast<unsigned char *>(state);
+    auto *mutex = reinterpret_cast<pthread_mutex_t *>(bytes + 0x18);
+    auto *condition = reinterpret_cast<pthread_cond_t *>(bytes + 0x58);
+    if (*reinterpret_cast<uint64_t *>(mutex) == 0x32aaaba7ULL) {
+      memset(mutex, 0, sizeof(*mutex));
+      pthread_mutex_init(mutex, nullptr);
+    }
+    if (*reinterpret_cast<uint64_t *>(condition) == 0x3cb0b1bbULL) {
+      memset(condition, 0, sizeof(*condition));
+      pthread_cond_init(condition, nullptr);
+    }
+  }
+  using Original = void (*)(void *, void *);
+  static Original original = [] {
+    void *library = dlopen("libc++.so.1", RTLD_NOW | RTLD_NOLOAD);
+    return reinterpret_cast<Original>(
+        dlsym(library, "_ZNSt3__17promiseIvE10get_futureEv"));
+  }();
+  if (!original)
+    _exit(86);
+  original(output, promise);
 }
 extern "C" int shim_threadid(pthread_t t, uint64_t *out) {
   if (t && !pthread_equal(t, pthread_self()))
@@ -367,6 +1268,8 @@ extern "C" int shim_fstat(int fd, DarwinStat *d) {
 extern "C" int shim_stat(const char *p, DarwinStat *d) {
   struct stat s;
   int r = stat(p, &s);
+  if (getenv("WETYPE_HOST_DEBUG"))
+    fprintf(stderr, "DARWIN_STAT path=%s result=%d errno=%d\n", p, r, errno);
   if (!r)
     convert_stat(s, d);
   return r;
@@ -448,7 +1351,13 @@ extern "C" int shim_open(const char *p, int f, ...) {
   int flags = open_flags(f);
   if (flags < 0)
     return -1;
-  return open(p, flags, mode);
+  int result = open(p, flags, mode);
+  if (getenv("WETYPE_HOST_DEBUG"))
+    fprintf(stderr,
+            "DARWIN_OPEN path=%s flags=%x translated=%x mode=%o result=%d "
+            "errno=%d\n",
+            p, f, flags, unsigned(mode), result, errno);
+  return result;
 }
 struct DarwinDirent {
   uint64_t ino, seek;
@@ -481,6 +1390,9 @@ extern "C" int shim_fcntl(int fd, int cmd, ...) {
   if (cmd != 1 && cmd != 3)
     arg = va_arg(ap, long);
   va_end(ap);
+  if (getenv("WETYPE_HOST_DEBUG"))
+    fprintf(stderr, "DARWIN_FCNTL fd=%d command=%d argument=%ld\n", fd, cmd,
+            arg);
   if (cmd == 7 || cmd == 8 || cmd == 9) {
     auto d = (DarwinFlock *)arg;
     struct flock f{};
@@ -554,7 +1466,7 @@ extern "C" void shim_bzero(void *p, size_t n) { memset(p, 0, n); }
 extern "C" int shim_atexit(void (*function)()) { return atexit(function); }
 static void *sec_random_default = nullptr;
 extern "C" int shim_sec_random_copy_bytes(void *, size_t size,
-                                           unsigned char *output) {
+                                          unsigned char *output) {
   size_t offset = 0;
   while (offset < size) {
     ssize_t count = getrandom(output + offset, size - offset, 0);
@@ -600,17 +1512,16 @@ struct DarwinMallocZone {
   void (*destroy_fn)(void *);
   const char *zone_name;
 };
-static DarwinMallocZone default_malloc_zone{
-    nullptr,
-    nullptr,
-    shim_malloc_zone_size,
-    shim_malloc_zone_malloc,
-    shim_malloc_zone_calloc,
-    shim_malloc_zone_valloc,
-    shim_malloc_zone_free,
-    shim_malloc_zone_realloc,
-    shim_malloc_zone_destroy,
-    "fcitx5-wetypex"};
+static DarwinMallocZone default_malloc_zone{nullptr,
+                                            nullptr,
+                                            shim_malloc_zone_size,
+                                            shim_malloc_zone_malloc,
+                                            shim_malloc_zone_calloc,
+                                            shim_malloc_zone_valloc,
+                                            shim_malloc_zone_free,
+                                            shim_malloc_zone_realloc,
+                                            shim_malloc_zone_destroy,
+                                            "fcitx5-wetypex"};
 extern "C" void *shim_malloc_default_zone() { return &default_malloc_zone; }
 extern "C" void *shim_malloc_create_zone(size_t, unsigned) {
   return &default_malloc_zone;
@@ -642,14 +1553,14 @@ static int sysctl_copy(const void *value, size_t size, void *old_value,
   return 0;
 }
 extern "C" int shim_sysctlbyname(const char *name, void *old_value,
-                                  size_t *old_size, const void *, size_t) {
+                                 size_t *old_size, const void *, size_t) {
   if (!name) {
     errno = EINVAL;
     return -1;
   }
   if (!strcmp(name, "hw.ncpu") || !strcmp(name, "hw.logicalcpu") ||
-      !strcmp(name, "hw.logicalcpu_max") ||
-      !strcmp(name, "hw.physicalcpu") || !strcmp(name, "hw.physicalcpu_max")) {
+      !strcmp(name, "hw.logicalcpu_max") || !strcmp(name, "hw.physicalcpu") ||
+      !strcmp(name, "hw.physicalcpu_max")) {
     int count = static_cast<int>(sysconf(_SC_NPROCESSORS_ONLN));
     if (count < 1)
       count = 1;
@@ -677,6 +1588,24 @@ extern "C" int shim_sysctlbyname(const char *name, void *old_value,
   if (text)
     return sysctl_copy(text, strlen(text) + 1, old_value, old_size);
   fprintf(stderr, "UNSUPPORTED sysctlbyname %s\n", name);
+  errno = ENOENT;
+  return -1;
+}
+extern "C" int shim_sysctl(const int *name, unsigned name_length,
+                           void *, size_t *old_size, const void *, size_t) {
+  // WXP2P uses CTL_NET/PF_ROUTE queries only to discover the system's default
+  // IPv4/IPv6 gateway. Linux exposes that information through netlink rather
+  // than Darwin routing sysctl records. Reporting the optional route table as
+  // unavailable makes the original library skip gateway-assisted direct
+  // probing and continue with its fully supported relay path.
+  if (getenv("WETYPE_HOST_DEBUG")) {
+    fputs("DARWIN_SYSCTL mib=", stderr);
+    for (unsigned i = 0; i < name_length; ++i)
+      fprintf(stderr, "%s%d", i ? "," : "", name ? name[i] : -1);
+    fputc('\n', stderr);
+  }
+  if (old_size)
+    *old_size = 0;
   errno = ENOENT;
   return -1;
 }
@@ -786,7 +1715,755 @@ static void *trap(const std::string &n) {
   code[21] = 0xe0;
   return code;
 }
+struct DispatchSemaphore {
+  sem_t value;
+};
+static pthread_mutex_t dispatch_semaphore_lock = PTHREAD_MUTEX_INITIALIZER;
+static std::set<void *> dispatch_semaphores;
+static pthread_mutex_t once_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t once_condition = PTHREAD_COND_INITIALIZER;
+static std::map<void *, int> once_states;
+static int shim_pthread_once(void *token, void (*initializer)()) {
+  pthread_mutex_lock(&once_lock);
+  auto [entry, inserted] = once_states.emplace(token, 1);
+  if (!inserted) {
+    while (entry->second == 1)
+      pthread_cond_wait(&once_condition, &once_lock);
+    pthread_mutex_unlock(&once_lock);
+    return 0;
+  }
+  pthread_mutex_unlock(&once_lock);
+  initializer();
+  pthread_mutex_lock(&once_lock);
+  once_states[token] = 2;
+  pthread_cond_broadcast(&once_condition);
+  pthread_mutex_unlock(&once_lock);
+  return 0;
+}
+static void *shim_dispatch_semaphore_create(long value) {
+  auto *semaphore = new DispatchSemaphore;
+  if (sem_init(&semaphore->value, 0, std::max(0L, value))) {
+    delete semaphore;
+    return nullptr;
+  }
+  pthread_mutex_lock(&dispatch_semaphore_lock);
+  dispatch_semaphores.insert(semaphore);
+  pthread_mutex_unlock(&dispatch_semaphore_lock);
+  return semaphore;
+}
+static long shim_dispatch_semaphore_signal(void *value) {
+  return sem_post(&static_cast<DispatchSemaphore *>(value)->value);
+}
+static long shim_dispatch_semaphore_wait(void *value, uint64_t timeout) {
+  auto *semaphore = static_cast<DispatchSemaphore *>(value);
+  int result = 0;
+  if (timeout == UINT64_MAX) {
+    do {
+      result = sem_wait(&semaphore->value);
+    } while (result && errno == EINTR);
+  } else {
+    timespec deadline{};
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += timeout / 1000000000ULL;
+    deadline.tv_nsec += timeout % 1000000000ULL;
+    if (deadline.tv_nsec >= 1000000000L) {
+      ++deadline.tv_sec;
+      deadline.tv_nsec -= 1000000000L;
+    }
+    do {
+      result = sem_timedwait(&semaphore->value, &deadline);
+    } while (result && errno == EINTR);
+  }
+  return result == 0 ? 0 : 1;
+}
+static void shim_dispatch_release(void *value) {
+  // libdispatch uses dispatch_release for queues, groups and semaphores.  Only
+  // semaphores are represented by a Linux object in this host; the other
+  // objects are owned by the original module.  Treating every value as our
+  // DispatchSemaphore corrupts its allocator during gRPC credential cleanup.
+  pthread_mutex_lock(&dispatch_semaphore_lock);
+  auto found = dispatch_semaphores.find(value);
+  if (found == dispatch_semaphores.end()) {
+    pthread_mutex_unlock(&dispatch_semaphore_lock);
+    return;
+  }
+  dispatch_semaphores.erase(found);
+  pthread_mutex_unlock(&dispatch_semaphore_lock);
+  auto *semaphore = static_cast<DispatchSemaphore *>(value);
+  sem_destroy(&semaphore->value);
+  delete semaphore;
+}
+static int shim_connectx() {
+  errno = ENOTSUP;
+  return -1;
+}
+static int darwin_errno(int value) {
+  switch (value) {
+  case EAGAIN:
+    return 35;
+  case EINPROGRESS:
+    return 36;
+  case EALREADY:
+    return 37;
+  case ENOTSOCK:
+    return 38;
+  case EDESTADDRREQ:
+    return 39;
+  case EMSGSIZE:
+    return 40;
+  case EPROTOTYPE:
+    return 41;
+  case ENOPROTOOPT:
+    return 42;
+  case EPROTONOSUPPORT:
+    return 43;
+  case ESOCKTNOSUPPORT:
+    return 44;
+  case ENOTSUP:
+    return 45;
+  case EAFNOSUPPORT:
+    return 47;
+  case EADDRINUSE:
+    return 48;
+  case EADDRNOTAVAIL:
+    return 49;
+  case ENETDOWN:
+    return 50;
+  case ENETUNREACH:
+    return 51;
+  case ENETRESET:
+    return 52;
+  case ECONNABORTED:
+    return 53;
+  case ECONNRESET:
+    return 54;
+  case ENOBUFS:
+    return 55;
+  case EISCONN:
+    return 56;
+  case ENOTCONN:
+    return 57;
+  case ESHUTDOWN:
+    return 58;
+  case ETIMEDOUT:
+    return 60;
+  case ECONNREFUSED:
+    return 61;
+  case ELOOP:
+    return 62;
+  case ENAMETOOLONG:
+    return 63;
+  case EHOSTUNREACH:
+    return 65;
+  case ENOTEMPTY:
+    return 66;
+  default:
+    return value;
+  }
+}
+template <typename T> static T translate_errno_result(T result) {
+  if (result < 0)
+    errno = darwin_errno(errno);
+  return result;
+}
+static ssize_t shim_read(int fd, void *buffer, size_t size) {
+  return translate_errno_result(read(fd, buffer, size));
+}
+static ssize_t shim_write(int fd, const void *buffer, size_t size) {
+  return translate_errno_result(write(fd, buffer, size));
+}
+static ssize_t shim_writev(int fd, const iovec *vectors, int count) {
+  return translate_errno_result(writev(fd, vectors, count));
+}
+static int shim_poll(pollfd *fds, nfds_t count, int timeout) {
+  return translate_errno_result(poll(fds, count, timeout));
+}
+static int linux_socket_domain(int domain) {
+  return domain == 30 ? AF_INET6 : domain;
+}
+static socklen_t linux_sockaddr(const void *source, socklen_t source_size,
+                                sockaddr_storage &destination) {
+  memset(&destination, 0, sizeof(destination));
+  if (!source || source_size < 2)
+    return 0;
+  const auto *bytes = static_cast<const unsigned char *>(source);
+  const unsigned family = bytes[1];
+  socklen_t size = std::min<socklen_t>(bytes[0] ? bytes[0] : source_size,
+                                       sizeof(destination));
+  memcpy(&destination, source, size);
+  reinterpret_cast<sockaddr *>(&destination)->sa_family =
+      linux_socket_domain(family);
+  return size;
+}
+static void darwin_sockaddr(const sockaddr_storage &source,
+                            socklen_t native_size, void *destination,
+                            socklen_t *destination_size) {
+  if (!destination_size)
+    return;
+  socklen_t size = std::min(*destination_size, native_size);
+  if (destination && size) {
+    memcpy(destination, &source, size);
+    auto *bytes = static_cast<unsigned char *>(destination);
+    bytes[0] = static_cast<unsigned char>(native_size);
+    bytes[1] = source.ss_family == AF_INET6 ? 30 : source.ss_family;
+  }
+  *destination_size = native_size;
+}
+static int shim_socket(int domain, int type, int protocol) {
+  int result = translate_errno_result(
+      socket(linux_socket_domain(domain), type, protocol));
+  if (getenv("WETYPE_HOST_DEBUG"))
+    fprintf(stderr,
+            "DARWIN_SOCKET domain=%d type=%d protocol=%d result=%d "
+            "errno=%d\n",
+            domain, type, protocol, result, errno);
+  return result;
+}
+static const char *shim_inet_ntop(int family, const void *source,
+                                  char *destination, socklen_t size) {
+  return inet_ntop(linux_socket_domain(family), source, destination, size);
+}
+static int shim_inet_pton(int family, const char *source, void *destination) {
+  return inet_pton(linux_socket_domain(family), source, destination);
+}
+struct DarwinAddrInfo {
+  int flags;
+  int family;
+  int socket_type;
+  int protocol;
+  socklen_t address_length;
+  char *canonical_name;
+  void *address;
+  DarwinAddrInfo *next;
+};
+static_assert(sizeof(DarwinAddrInfo) == 48);
+static int shim_getaddrinfo(const char *node, const char *service,
+                            const DarwinAddrInfo *hints,
+                            DarwinAddrInfo **result) {
+  if (!result)
+    return EAI_FAIL;
+  addrinfo native_hints{};
+  const addrinfo *native_hints_pointer = nullptr;
+  if (hints) {
+    native_hints.ai_flags = hints->flags;
+    native_hints.ai_family = linux_socket_domain(hints->family);
+    native_hints.ai_socktype = hints->socket_type;
+    native_hints.ai_protocol = hints->protocol;
+    native_hints_pointer = &native_hints;
+  }
+  addrinfo *native = nullptr;
+  int status = getaddrinfo(node, service, native_hints_pointer, &native);
+  if (status)
+    return status;
+  DarwinAddrInfo *head = nullptr, **tail = &head;
+  for (auto *item = native; item; item = item->ai_next) {
+    auto *copy = new DarwinAddrInfo{};
+    copy->flags = item->ai_flags;
+    copy->family = item->ai_family == AF_INET6 ? 30 : item->ai_family;
+    copy->socket_type = item->ai_socktype;
+    copy->protocol = item->ai_protocol;
+    copy->address_length = item->ai_addrlen;
+    if (item->ai_canonname)
+      copy->canonical_name = strdup(item->ai_canonname);
+    copy->address = calloc(1, item->ai_addrlen);
+    if (copy->address) {
+      memcpy(copy->address, item->ai_addr, item->ai_addrlen);
+      auto *bytes = static_cast<unsigned char *>(copy->address);
+      bytes[0] = static_cast<unsigned char>(item->ai_addrlen);
+      bytes[1] = static_cast<unsigned char>(copy->family);
+    }
+    *tail = copy;
+    tail = &copy->next;
+  }
+  freeaddrinfo(native);
+  *result = head;
+  if (getenv("WETYPE_HOST_DEBUG"))
+    fprintf(stderr, "DARWIN_GETADDRINFO node=%s service=%s result=%p\n",
+            node ? node : "", service ? service : "", (void *)head);
+  return 0;
+}
+static void shim_freeaddrinfo(DarwinAddrInfo *value) {
+  while (value) {
+    auto *next = value->next;
+    free(value->canonical_name);
+    free(value->address);
+    delete value;
+    value = next;
+  }
+}
+static int shim_bind(int socket_fd, const void *address, socklen_t size) {
+  sockaddr_storage translated{};
+  socklen_t translated_size = linux_sockaddr(address, size, translated);
+  if (!translated_size) {
+    errno = EINVAL;
+    return -1;
+  }
+  int result = translate_errno_result(bind(
+      socket_fd, reinterpret_cast<sockaddr *>(&translated), translated_size));
+  if (getenv("WETYPE_HOST_DEBUG"))
+    fprintf(stderr, "DARWIN_BIND fd=%d family=%d size=%u result=%d errno=%d\n",
+            socket_fd, int(translated.ss_family), unsigned(translated_size),
+            result, errno);
+  return result;
+}
+static int shim_connect(int socket_fd, const void *address, socklen_t size) {
+  sockaddr_storage translated{};
+  socklen_t translated_size = linux_sockaddr(address, size, translated);
+  if (!translated_size) {
+    errno = EINVAL;
+    return -1;
+  }
+  return translate_errno_result(connect(
+      socket_fd, reinterpret_cast<sockaddr *>(&translated), translated_size));
+}
+static int shim_getsockname(int socket_fd, void *address, socklen_t *size) {
+  sockaddr_storage native{};
+  socklen_t native_size = sizeof(native);
+  int result = translate_errno_result(getsockname(
+      socket_fd, reinterpret_cast<sockaddr *>(&native), &native_size));
+  if (!result)
+    darwin_sockaddr(native, native_size, address, size);
+  if (getenv("WETYPE_HOST_DEBUG"))
+    fprintf(stderr,
+            "DARWIN_GETSOCKNAME fd=%d family=%d size=%u result=%d errno=%d\n",
+            socket_fd, int(native.ss_family), unsigned(native_size), result,
+            errno);
+  return result;
+}
+static int shim_listen(int socket_fd, int backlog) {
+  int result = translate_errno_result(listen(socket_fd, backlog));
+  if (getenv("WETYPE_HOST_DEBUG"))
+    fprintf(stderr, "DARWIN_LISTEN fd=%d backlog=%d result=%d errno=%d\n",
+            socket_fd, backlog, result, errno);
+  return result;
+}
+static pthread_mutex_t socket_state_lock = PTHREAD_MUTEX_INITIALIZER;
+static std::set<int> no_sigpipe_sockets;
+static int shim_accept(int socket_fd, void *address, socklen_t *size) {
+  sockaddr_storage native{};
+  socklen_t native_size = sizeof(native);
+  int result = translate_errno_result(
+      accept(socket_fd, reinterpret_cast<sockaddr *>(&native),
+             address ? &native_size : nullptr));
+  if (result >= 0 && address)
+    darwin_sockaddr(native, native_size, address, size);
+  return result;
+}
+struct DarwinMessageHeader {
+  void *name;
+  socklen_t name_length;
+  uint32_t name_padding;
+  iovec *vectors;
+  int vector_count;
+  uint32_t vector_padding;
+  void *control;
+  socklen_t control_length;
+  int flags;
+};
+static_assert(sizeof(DarwinMessageHeader) == 48);
+static int linux_message_flags(int flags) {
+  int translated = flags & ~(0x80 | 0x80000);
+  if (flags & 0x80) // Darwin MSG_DONTWAIT
+    translated |= MSG_DONTWAIT;
+#ifdef MSG_CMSG_CLOEXEC
+  if (flags & 0x80000)
+    translated |= MSG_CMSG_CLOEXEC;
+#endif
+  return translated;
+}
+static bool socket_uses_no_sigpipe(int socket_fd) {
+  pthread_mutex_lock(&socket_state_lock);
+  bool enabled = no_sigpipe_sockets.count(socket_fd);
+  pthread_mutex_unlock(&socket_state_lock);
+  return enabled;
+}
+static ssize_t shim_send(int socket_fd, const void *buffer, size_t size,
+                         int flags) {
+  int translated = linux_message_flags(flags);
+  if (socket_uses_no_sigpipe(socket_fd))
+    translated |= MSG_NOSIGNAL;
+  return translate_errno_result(send(socket_fd, buffer, size, translated));
+}
+static ssize_t shim_sendto(int socket_fd, const void *buffer, size_t size,
+                           int flags, const void *address,
+                           socklen_t address_size) {
+  sockaddr_storage translated_address{};
+  socklen_t translated_size =
+      address ? linux_sockaddr(address, address_size, translated_address) : 0;
+  int translated_flags = linux_message_flags(flags);
+  if (socket_uses_no_sigpipe(socket_fd))
+    translated_flags |= MSG_NOSIGNAL;
+  return translate_errno_result(sendto(
+      socket_fd, buffer, size, translated_flags,
+      address ? reinterpret_cast<sockaddr *>(&translated_address) : nullptr,
+      translated_size));
+}
+static ssize_t shim_recvfrom(int socket_fd, void *buffer, size_t size,
+                             int flags, void *address,
+                             socklen_t *address_size) {
+  sockaddr_storage native_address{};
+  socklen_t native_size = sizeof(native_address);
+  ssize_t result = translate_errno_result(recvfrom(
+      socket_fd, buffer, size, linux_message_flags(flags),
+      address ? reinterpret_cast<sockaddr *>(&native_address) : nullptr,
+      address ? &native_size : nullptr));
+  if (result >= 0 && address)
+    darwin_sockaddr(native_address, native_size, address, address_size);
+  return result;
+}
+static ssize_t shim_sendmsg(int socket_fd, const DarwinMessageHeader *message,
+                            int flags) {
+  if (!message) {
+    errno = EINVAL;
+    return -1;
+  }
+  sockaddr_storage translated_address{};
+  msghdr native{};
+  if (message->name) {
+    native.msg_namelen =
+        linux_sockaddr(message->name, message->name_length, translated_address);
+    native.msg_name = &translated_address;
+  }
+  native.msg_iov = message->vectors;
+  native.msg_iovlen = std::max(0, message->vector_count);
+  // TCP transfer frames do not carry ancillary data. Passing Darwin cmsghdr
+  // bytes to Linux would be unsafe because its length field is wider.
+  if (message->control_length) {
+    errno = 22;
+    return -1;
+  }
+  int translated_flags = linux_message_flags(flags);
+  if (socket_uses_no_sigpipe(socket_fd))
+    translated_flags |= MSG_NOSIGNAL;
+  ssize_t result =
+      translate_errno_result(sendmsg(socket_fd, &native, translated_flags));
+  if (getenv("WETYPE_HOST_DEBUG"))
+    fprintf(stderr,
+            "DARWIN_SENDMSG fd=%d vectors=%d control=%u flags=%x result=%zd "
+            "errno=%d\n",
+            socket_fd, message->vector_count, message->control_length, flags,
+            result, errno);
+  return result;
+}
+static ssize_t shim_recvmsg(int socket_fd, DarwinMessageHeader *message,
+                            int flags) {
+  if (!message) {
+    errno = EINVAL;
+    return -1;
+  }
+  sockaddr_storage native_address{};
+  msghdr native{};
+  if (message->name) {
+    native.msg_name = &native_address;
+    native.msg_namelen = sizeof(native_address);
+  }
+  native.msg_iov = message->vectors;
+  native.msg_iovlen = std::max(0, message->vector_count);
+  std::vector<unsigned char> native_control;
+  if (message->control && message->control_length) {
+    native_control.resize(message->control_length + 32);
+    native.msg_control = native_control.data();
+    native.msg_controllen = native_control.size();
+  }
+  ssize_t result = translate_errno_result(
+      recvmsg(socket_fd, &native, linux_message_flags(flags)));
+  if (getenv("WETYPE_HOST_DEBUG"))
+    fprintf(stderr,
+            "DARWIN_RECVMSG fd=%d vectors=%d control=%u flags=%x result=%zd "
+            "errno=%d\n",
+            socket_fd, message->vector_count, message->control_length, flags,
+            result, errno);
+  if (result < 0)
+    return result;
+  if (message->name)
+    darwin_sockaddr(native_address, native.msg_namelen, message->name,
+                    &message->name_length);
+  message->flags = native.msg_flags;
+  // No ancillary messages are used by the gRPC TCP transport. Report no
+  // Darwin control bytes rather than exposing Linux cmsghdr layout.
+  message->control_length = 0;
+  return result;
+}
+static int linux_socket_level(int level) {
+  return level == 0xffff ? SOL_SOCKET : level;
+}
+static int linux_socket_option(int level, int option) {
+  if (level == 0xffff) {
+    switch (option) {
+    case 0x4:
+      return SO_REUSEADDR;
+    case 0x8:
+      return SO_KEEPALIVE;
+    case 0x10:
+      return SO_DONTROUTE;
+    case 0x20:
+      return SO_BROADCAST;
+    case 0x80:
+      return SO_LINGER;
+    case 0x100:
+      return SO_OOBINLINE;
+    case 0x200:
+      return SO_REUSEPORT;
+    case 0x1001:
+      return SO_SNDBUF;
+    case 0x1002:
+      return SO_RCVBUF;
+    case 0x1003:
+      return SO_SNDLOWAT;
+    case 0x1004:
+      return SO_RCVLOWAT;
+    case 0x1005:
+      return SO_SNDTIMEO;
+    case 0x1006:
+      return SO_RCVTIMEO;
+    case 0x1007:
+      return SO_ERROR;
+    case 0x1008:
+      return SO_TYPE;
+    case 0x1022: // SO_NOSIGPIPE; Linux uses MSG_NOSIGNAL.
+      return -1;
+    default:
+      return option;
+    }
+  }
+  if (level == IPPROTO_IPV6 && option == 27)
+    return IPV6_V6ONLY;
+  return option;
+}
+static int shim_setsockopt(int socket_fd, int level, int option,
+                           const void *value, socklen_t size) {
+  int translated = linux_socket_option(level, option);
+  if (translated < 0) {
+    bool enabled =
+        value && size >= sizeof(int) && *static_cast<const int *>(value);
+    pthread_mutex_lock(&socket_state_lock);
+    if (enabled)
+      no_sigpipe_sockets.insert(socket_fd);
+    else
+      no_sigpipe_sockets.erase(socket_fd);
+    pthread_mutex_unlock(&socket_state_lock);
+    if (getenv("WETYPE_HOST_DEBUG"))
+      fprintf(stderr, "DARWIN_SETSOCKOPT fd=%d SO_NOSIGPIPE=%d result=0\n",
+              socket_fd, enabled);
+    return 0;
+  }
+  int result = translate_errno_result(setsockopt(
+      socket_fd, linux_socket_level(level), translated, value, size));
+  if (getenv("WETYPE_HOST_DEBUG"))
+    fprintf(stderr,
+            "DARWIN_SETSOCKOPT fd=%d level=%d option=%d translated=%d/%d "
+            "result=%d errno=%d\n",
+            socket_fd, level, option, linux_socket_level(level), translated,
+            result, errno);
+  return result;
+}
+static int shim_getsockopt(int socket_fd, int level, int option, void *value,
+                           socklen_t *size) {
+  int translated = linux_socket_option(level, option);
+  if (translated < 0) {
+    pthread_mutex_lock(&socket_state_lock);
+    bool enabled = no_sigpipe_sockets.count(socket_fd);
+    pthread_mutex_unlock(&socket_state_lock);
+    if (value && size && *size >= sizeof(int)) {
+      *static_cast<int *>(value) = enabled;
+      *size = sizeof(int);
+    }
+    if (getenv("WETYPE_HOST_DEBUG"))
+      fprintf(stderr, "DARWIN_GETSOCKOPT fd=%d SO_NOSIGPIPE=%d result=0\n",
+              socket_fd, enabled);
+    return 0;
+  }
+  int result = translate_errno_result(getsockopt(
+      socket_fd, linux_socket_level(level), translated, value, size));
+  if (getenv("WETYPE_HOST_DEBUG"))
+    fprintf(stderr,
+            "DARWIN_GETSOCKOPT fd=%d level=%d option=%d translated=%d/%d "
+            "result=%d errno=%d\n",
+            socket_fd, level, option, linux_socket_level(level), translated,
+            result, errno);
+  return result;
+}
+static int shim_strerror_r(int error, char *buffer, size_t size) {
+  const char *message = strerror(error);
+  if (!buffer || !size)
+    return ERANGE;
+  size_t length = strlen(message);
+  if (length >= size) {
+    memcpy(buffer, message, size - 1);
+    buffer[size - 1] = 0;
+    return ERANGE;
+  }
+  memcpy(buffer, message, length + 1);
+  return 0;
+}
+static int shim_close(int fd) {
+  if (getenv("WETYPE_HOST_DEBUG"))
+    fprintf(stderr, "DARWIN_CLOSE fd=%d caller=%p\n", fd,
+            __builtin_return_address(0));
+  pthread_mutex_lock(&socket_state_lock);
+  no_sigpipe_sockets.erase(fd);
+  pthread_mutex_unlock(&socket_state_lock);
+  return close(fd);
+}
+static int shim_ioctl(int fd, unsigned long request, void *argument) {
+  constexpr unsigned long DarwinFionbio = 0x8004667eUL;
+  constexpr unsigned long DarwinFionread = 0x4004667fUL;
+  unsigned long native = request;
+  if (request == DarwinFionbio)
+    native = FIONBIO;
+  else if (request == DarwinFionread)
+    native = FIONREAD;
+  int result = ioctl(fd, native, argument);
+  if (getenv("WETYPE_HOST_DEBUG"))
+    fprintf(stderr,
+            "DARWIN_IOCTL fd=%d request=%lx native=%lx result=%d errno=%d\n",
+            fd, request, native, result, errno);
+  return translate_errno_result(result);
+}
+static const char *libcpp_path_cstr(const void *path) {
+  if (!path)
+    return nullptr;
+  const auto *bytes = static_cast<const unsigned char *>(path);
+  if (bytes[0] & 1) {
+    const char *value = nullptr;
+    memcpy(&value, bytes + 16, sizeof(value));
+    return value;
+  }
+  return reinterpret_cast<const char *>(bytes + 1);
+}
+static void set_libcpp_error_code(void *errorCode, int value) {
+  if (errorCode)
+    memcpy(errorCode, &value, sizeof(value));
+}
+static int copy_across_filesystems(const char *source, const char *target) {
+  int input = open(source, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+  if (input < 0)
+    return -1;
+  struct stat sourceStatus {};
+  if (fstat(input, &sourceStatus) || !S_ISREG(sourceStatus.st_mode)) {
+    const int error = errno ? errno : EINVAL;
+    close(input);
+    errno = error;
+    return -1;
+  }
+  std::string temporary = std::string(target) + ".wetypex.XXXXXX";
+  std::vector<char> name(temporary.begin(), temporary.end());
+  name.push_back(0);
+  int output = mkstemp(name.data());
+  if (output < 0) {
+    const int error = errno;
+    close(input);
+    errno = error;
+    return -1;
+  }
+  fcntl(output, F_SETFD, FD_CLOEXEC);
+  fchmod(output, sourceStatus.st_mode & 0777);
+  std::array<unsigned char, 131072> buffer{};
+  int error = 0;
+  while (!error) {
+    ssize_t count = read(input, buffer.data(), buffer.size());
+    if (!count)
+      break;
+    if (count < 0) {
+      if (errno == EINTR)
+        continue;
+      error = errno;
+      break;
+    }
+    ssize_t offset = 0;
+    while (offset < count) {
+      ssize_t written = write(output, buffer.data() + offset, count - offset);
+      if (written > 0)
+        offset += written;
+      else if (written < 0 && errno == EINTR)
+        continue;
+      else {
+        error = errno ? errno : EIO;
+        break;
+      }
+    }
+  }
+  if (!error && fsync(output))
+    error = errno;
+  if (close(output) && !error)
+    error = errno;
+  close(input);
+  if (!error && rename(name.data(), target))
+    error = errno;
+  if (!error && unlink(source))
+    error = errno;
+  if (error) {
+    unlink(name.data());
+    errno = error;
+    return -1;
+  }
+  return 0;
+}
+static void shim_filesystem_rename(const void *sourcePath,
+                                   const void *targetPath, void *errorCode) {
+  const char *source = libcpp_path_cstr(sourcePath);
+  const char *target = libcpp_path_cstr(targetPath);
+  int result = -1;
+  if (source && target)
+    result = rename(source, target);
+  if (result && errno == EXDEV)
+    result = copy_across_filesystems(source, target);
+  const int error = result ? (errno ? errno : EIO) : 0;
+  set_libcpp_error_code(errorCode, error);
+  if (getenv("WETYPE_HOST_DEBUG"))
+    fprintf(stderr,
+            "DARWIN_FILESYSTEM_RENAME source=%s target=%s result=%d errno=%d\n",
+            source ? source : "(null)", target ? target : "(null)", result,
+            error);
+}
+static int shim_notify_register() { return ENOTSUP; }
+static int shim_notify_cancel() { return 0; }
+static int shim_fd_overflow(int fd) { return fd >= FD_SETSIZE; }
+static bool address_is_in_mapped_image(const void *value) {
+  const auto address = reinterpret_cast<uintptr_t>(value);
+  for (const auto &[begin, end] : mapped_image_ranges)
+    if (address >= begin && address < end)
+      return true;
+  return false;
+}
+static void shim_free(void *value) {
+  // Some bundled BoringSSL/OpenSSL compatibility objects are backed directly
+  // by Mach-O __DATA and are accepted by Darwin's allocator cleanup path.  A
+  // glibc free on those image addresses aborts.  They remain owned by the
+  // mapped image and must live until the compatibility host exits.
+  if (!value || address_is_in_mapped_image(value))
+    return;
+  free(value);
+}
+static void shim_uuid_generate(unsigned char *output) {
+  if (!output)
+    return;
+  size_t offset = 0;
+  while (offset < 16) {
+    ssize_t count = getrandom(output + offset, 16 - offset, 0);
+    if (count > 0)
+      offset += size_t(count);
+    else if (count < 0 && errno == EINTR)
+      continue;
+    else
+      abort();
+  }
+  output[6] = (output[6] & 0x0f) | 0x40;
+  output[8] = (output[8] & 0x3f) | 0x80;
+}
+static void shim_uuid_unparse(const unsigned char *value, char *output) {
+  if (!value || !output)
+    return;
+  snprintf(output, 37,
+           "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-"
+           "%02x%02x%02x%02x%02x%02x",
+           value[0], value[1], value[2], value[3], value[4], value[5], value[6],
+           value[7], value[8], value[9], value[10], value[11], value[12],
+           value[13], value[14], value[15]);
+}
 static void *resolve(const std::string &name) {
+  if (auto symbol = syms.find(name); symbol != syms.end())
+    return reinterpret_cast<void *>(symbol->second);
   static std::map<std::string, void *> overrides = {
       {"___stack_chk_guard", &stack_guard},
       {"___error", (void *)shim_error},
@@ -810,7 +2487,57 @@ static void *resolve(const std::string &name) {
       {"_malloc_zone_realloc", (void *)shim_malloc_zone_realloc},
       {"_reallocf", (void *)shim_reallocf},
       {"_sysctlbyname", (void *)shim_sysctlbyname},
+      {"_sysctl", (void *)shim_sysctl},
       {"_mmap", (void *)shim_mmap},
+      {"___darwin_check_fd_set_overflow", (void *)shim_fd_overflow},
+      {"_accept", (void *)shim_accept},
+      {"_bind", (void *)shim_bind},
+      {"_close", (void *)shim_close},
+      {"_connect", (void *)shim_connect},
+      {"_connectx", (void *)shim_connectx},
+      {"_dispatch_release", (void *)shim_dispatch_release},
+      {"_dispatch_semaphore_create", (void *)shim_dispatch_semaphore_create},
+      {"_dispatch_semaphore_signal", (void *)shim_dispatch_semaphore_signal},
+      {"_dispatch_semaphore_wait", (void *)shim_dispatch_semaphore_wait},
+      {"_fopen$DARWIN_EXTSN", (void *)fopen},
+      {"_free", (void *)shim_free},
+      {"_freeaddrinfo", (void *)shim_freeaddrinfo},
+      {"_getaddrinfo", (void *)shim_getaddrinfo},
+      {"_getsockname", (void *)shim_getsockname},
+      {"_getsockopt", (void *)shim_getsockopt},
+      {"_inet_ntop", (void *)shim_inet_ntop},
+      {"_inet_pton", (void *)shim_inet_pton},
+      {"_ioctl", (void *)shim_ioctl},
+      {"_listen", (void *)shim_listen},
+      {"_notify_cancel", (void *)shim_notify_cancel},
+      {"_notify_register_file_descriptor", (void *)shim_notify_register},
+      {"_poll", (void *)shim_poll},
+      {"_pthread_atfork", (void *)pthread_atfork},
+      {"_pthread_attr_destroy", (void *)shim_pthread_attr_destroy},
+      {"_pthread_attr_init", (void *)shim_pthread_attr_init},
+      {"_pthread_attr_setdetachstate",
+       (void *)shim_pthread_attr_setdetachstate},
+      {"_pthread_attr_setstacksize", (void *)shim_pthread_attr_setstacksize},
+      {"_pthread_create", (void *)shim_pthread_create},
+      {"_pthread_once", (void *)shim_pthread_once},
+      {"_read", (void *)shim_read},
+      {"_recvfrom", (void *)shim_recvfrom},
+      {"_recvmsg", (void *)shim_recvmsg},
+      {"_select$1050", (void *)select},
+      {"_select$DARWIN_EXTSN", (void *)select},
+      {"_sigsetjmp", (void *)__sigsetjmp},
+      {"_setsockopt", (void *)shim_setsockopt},
+      {"_send", (void *)shim_send},
+      {"_sendmsg", (void *)shim_sendmsg},
+      {"_sendto", (void *)shim_sendto},
+      {"_socket", (void *)shim_socket},
+      {"_strerror_r", (void *)shim_strerror_r},
+      {"_write", (void *)shim_write},
+      {"_writev", (void *)shim_writev},
+      {"_uuid_generate", (void *)shim_uuid_generate},
+      {"_uuid_unparse", (void *)shim_uuid_unparse},
+      {"__ZNSt3__14__fs10filesystem8__renameERKNS1_4pathES4_PNS_10error_codeE",
+       (void *)shim_filesystem_rename},
       {"_fstat$INODE64", (void *)shim_fstat},
       {"_fstatfs$INODE64", (void *)shim_fstatfs},
       {"_stat$INODE64", (void *)shim_stat},
@@ -856,6 +2583,7 @@ static void *resolve(const std::string &name) {
       {"_pthread_threadid_np", (void *)shim_threadid},
       {"__ZNSt3__15mutex4lockEv", (void *)shim_mutex_lock},
       {"__ZNSt3__15mutex6unlockEv", (void *)shim_mutex_unlock},
+      {"__ZNSt3__15mutex8try_lockEv", (void *)shim_cpp_mutex_try_lock},
       {"__ZNSt3__15mutexD1Ev", (void *)shim_mutex_destroy},
       {"__ZNSt3__118condition_variable4waitERNS_11unique_lockINS_5mutexEEE",
        (void *)shim_cpp_cv_wait},
@@ -863,7 +2591,13 @@ static void *resolve(const std::string &name) {
        (void *)shim_cond_signal},
       {"__ZNSt3__118condition_variable10notify_allEv",
        (void *)shim_cond_broadcast},
+      {"__ZNSt3__118condition_variable15__do_timed_waitERNS_11unique_lockINS_"
+       "5mutexEEENS_6chrono10time_pointINS5_12system_clockENS5_8durationIxNS_"
+       "5ratioILl1ELl1000000000EEEEEEE",
+       (void *)shim_cpp_cv_timed_wait},
       {"__ZNSt3__118condition_variableD1Ev", (void *)shim_cond_destroy}};
+  overrides.emplace("__ZNSt3__17promiseIvE10get_futureEv",
+                    (void *)shim_promise_void_get_future);
   auto it = overrides.find(name);
   if (it != overrides.end())
     return it->second;
@@ -883,8 +2617,8 @@ static void engine_log(int level, const char *s) {
   if (!service_mode)
     fprintf(stderr, "IME[%d] %s\n", level, s ? s : "(null)");
 }
-#include "service.inc"
-#include "business_services.inc"
+#include "business_services.hpp"
+#include "service.hpp"
 struct LlmResultItem {
   const unsigned char *data;
   uint32_t data_length, pad0;
@@ -913,11 +2647,14 @@ static std::vector<unsigned char> llm_service_cookie;
 static unsigned llm_service_events = 0;
 static std::atomic<bool> llm_service_finished{false};
 static void llm_service_callback(LlmEvent event) {
-  fprintf(stdout,
-          "LLM_EVENT chat=%d frame=%d error=%d end=%d results=%u\n",
+  fprintf(stdout, "LLM_EVENT chat=%d frame=%d error=%d end=%d results=%u\n",
           event.chat_id, event.frame, event.error_code, event.is_end,
           event.result_count);
   fprintf(stdout, "LLM_COOKIE bytes=%u\n", event.cookie_length);
+  if (event.cookie_length > 4194304 || (event.cookie_length && !event.cookie) ||
+      event.additional_length > 4194304 ||
+      (event.additional_length && !event.additional))
+    _exit(89);
   if (event.result_count > 64 || (event.result_count && !event.results))
     _exit(89);
   for (unsigned i = 0; i < event.result_count; ++i) {
@@ -935,11 +2672,13 @@ static void llm_service_callback(LlmEvent event) {
         metadata.find("\"is_answer_end\":true") != std::string::npos)
       llm_service_finished = true;
   }
+  if (event.is_end)
+    llm_service_finished = true;
   {
     std::lock_guard lock(llm_service_mutex);
     llm_service_cookie.assign(event.cookie,
-                            event.cookie ? event.cookie + event.cookie_length
-                                         : event.cookie);
+                              event.cookie ? event.cookie + event.cookie_length
+                                           : event.cookie);
     ++llm_service_events;
   }
   fflush(stdout);
@@ -962,7 +2701,8 @@ static void run_llm_service(const char *question) {
   const char *app = "LINUX";
   using Search = uint32_t (*)(decltype(&llm_service_callback), LlmSearchParam);
   auto search = (Search)syms.at("_wxime_cloud_llm_search_without_session");
-  auto invoke = [&](const char *text, const std::vector<unsigned char> &cookie) {
+  auto invoke = [&](const char *text,
+                    const std::vector<unsigned char> &cookie) {
     LlmSearchParam parameter{text,
                              uint32_t(strlen(text)),
                              0,
@@ -1066,9 +2806,15 @@ int main(int argc, char **argv) {
     fprintf(stderr, "usage: host PREPARED_DIR MODE [ASCII_PINYIN]\n");
     return 2;
   }
-  service_mode = !strcmp(argv[2], "serve");
-  if (!service_mode)
-    alarm(!strcmp(argv[2], "llm-service") ? 45 : 15);
+  service_mode = !strcmp(argv[2], "serve") ||
+                 !strcmp(argv[2], "flurry-server") ||
+                 !strcmp(argv[2], "flurry-wxp2p-server") ||
+                 !strcmp(argv[2], "wxp2p-probe");
+  if (!service_mode) {
+    const bool long_operation =
+        !strcmp(argv[2], "llm-service") || !strcmp(argv[2], "flurry-loopback");
+    alarm(long_operation ? 45 : 15);
+  }
   initialize_rune_locale();
   setvbuf(stderr, nullptr, _IONBF, 0);
   struct sigaction sa{};
@@ -1085,7 +2831,10 @@ int main(int argc, char **argv) {
   }
   const char *support = getenv("WETYPE_SUPPORT_DIR");
   std::string support_dir = support ? support : argv[1];
-  if (!dlopen((support_dir + "/locale.so").c_str(), RTLD_NOW | RTLD_GLOBAL)) {
+  auto localePath = support_dir + "/locale.so";
+  if (access(localePath.c_str(), R_OK) != 0)
+    localePath = support_dir + "/wetypex-locale.so";
+  if (!dlopen(localePath.c_str(), RTLD_NOW | RTLD_GLOBAL)) {
     fputs(dlerror(), stderr);
     return 2;
   }
@@ -1100,84 +2849,102 @@ int main(int argc, char **argv) {
     return 2;
   }
   std::string dir = argv[1], mode = argv[2], line;
-  std::ifstream symbols(dir + "/symbols.txt");
-  while (std::getline(symbols, line)) {
-    std::istringstream s(line);
-    uintptr_t a;
-    std::string n;
-    s >> std::hex >> a >> n;
-    if (!n.empty())
-      address_names.emplace_back(a, n);
-  }
-  std::ifstream file(dir + "/manifest.txt");
   std::vector<std::string> binds, unwinds;
   std::vector<std::pair<uintptr_t, std::string>> ctors;
-  int fd = open((dir + "/image.macho").c_str(), O_RDONLY);
-  if (fd < 0)
-    return 2;
-  while (std::getline(file, line)) {
-    std::istringstream s(line);
-    std::string type;
-    s >> type;
-    if (type == "SEG") {
-      uintptr_t addr, size, off, len;
-      int prot;
-      std::string n;
-      s >> std::hex >> addr >> size >> off >> len >> std::dec >> prot >> n;
-      size = (size + 4095) & ~4095ULL;
-      if (n == "__LINKEDIT")
-        continue; // Symbol/relocation metadata is already prepared.
-      void *m = mmap((void *)addr, size, PROT_READ | PROT_WRITE,
-                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
-      if (m == MAP_FAILED) {
-        perror("map segment");
-        return 2;
-      }
-      if (len) {
-        if (len % 4096 || off % 4096) {
-          fputs("unsupported segment alignment\n", stderr);
-          return 2;
-        }
-        int protection =
-            (prot & 4) ? PROT_READ | PROT_EXEC : PROT_READ | PROT_WRITE;
-        if (mmap(m, len, protection, MAP_PRIVATE | MAP_FIXED, fd, off) ==
-            MAP_FAILED) {
-          perror("map file segment");
-          return 2;
-        }
-      }
-    } else if (type == "BIND")
-      binds.push_back(line);
-    else if (type == "OWN") {
-      uintptr_t a, v;
-      long add;
-      s >> std::hex >> a >> v >> std::dec >> add;
-      *(uintptr_t *)a = v + add;
-    } else if (type == "UNWIND")
-      unwinds.push_back(line);
-    else if (type == "SYM") {
-      uintptr_t a;
-      std::string n;
-      s >> std::hex >> a >> n;
-      syms[n] = a;
-    } else if (type == "CTOR") {
-      uintptr_t a;
-      std::string n;
-      s >> std::hex >> a >> n;
-      ctors.emplace_back(a, n);
-    } else if (type == "SECTION") {
-      uintptr_t a, size;
-      std::string n;
-      s >> std::hex >> a >> size >> n;
-      if (n == "__thread_data") {
-        tls_data = a;
-        tls_size = size;
-      }
-      if (n == "__thread_bss")
-        tls_total = a + size;
+  auto loadModule = [&](const std::string &moduleDir) {
+    std::ifstream symbols(moduleDir + "/symbols.txt");
+    while (std::getline(symbols, line)) {
+      std::istringstream stream(line);
+      uintptr_t address;
+      std::string name;
+      stream >> std::hex >> address >> name;
+      if (!name.empty())
+        address_names.emplace_back(address, name);
     }
-  }
-  close(fd);
+    std::ifstream manifest(moduleDir + "/manifest.txt");
+    int module = open((moduleDir + "/image.macho").c_str(), O_RDONLY);
+    if (module < 0)
+      return false;
+    while (std::getline(manifest, line)) {
+      std::istringstream stream(line);
+      std::string type;
+      stream >> type;
+      if (type == "SEG") {
+        uintptr_t address, size, offset, length;
+        int protection;
+        std::string name;
+        stream >> std::hex >> address >> size >> offset >> length >> std::dec >>
+            protection >> name;
+        size = (size + 4095) & ~4095ULL;
+        if (name == "__LINKEDIT")
+          continue;
+        void *mapping = mmap(
+            reinterpret_cast<void *>(address), size, PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+        if (mapping == MAP_FAILED) {
+          perror("map segment");
+          close(module);
+          return false;
+        }
+        mapped_image_ranges.emplace_back(address, address + size);
+        if (length) {
+          if (length % 4096 || offset % 4096) {
+            fputs("unsupported segment alignment\n", stderr);
+            close(module);
+            return false;
+          }
+          int nativeProtection =
+              (protection & 4) ? PROT_READ | PROT_EXEC : PROT_READ | PROT_WRITE;
+          if (mmap(mapping, length, nativeProtection, MAP_PRIVATE | MAP_FIXED,
+                   module, offset) == MAP_FAILED) {
+            perror("map file segment");
+            close(module);
+            return false;
+          }
+        }
+      } else if (type == "BIND")
+        binds.push_back(line);
+      else if (type == "REBASE") {
+        uintptr_t address, slide;
+        stream >> std::hex >> address >> slide;
+        *reinterpret_cast<uintptr_t *>(address) += slide;
+      } else if (type == "OWN") {
+        uintptr_t address, value;
+        long addend;
+        stream >> std::hex >> address >> value >> std::dec >> addend;
+        *reinterpret_cast<uintptr_t *>(address) = value + addend;
+      } else if (type == "UNWIND")
+        unwinds.push_back(line);
+      else if (type == "SYM") {
+        uintptr_t address;
+        std::string name;
+        stream >> std::hex >> address >> name;
+        syms[name] = address;
+      } else if (type == "CTOR") {
+        uintptr_t address;
+        std::string name;
+        stream >> std::hex >> address >> name;
+        ctors.emplace_back(address, name);
+      } else if (type == "SECTION") {
+        uintptr_t address, size;
+        std::string name;
+        stream >> std::hex >> address >> size >> name;
+        if (name == "__thread_data") {
+          tls_data = address;
+          tls_size = size;
+        }
+        if (name == "__thread_bss")
+          tls_total = address + size;
+      }
+    }
+    close(module);
+    return true;
+  };
+  if (const char *auxiliary = getenv("WETYPE_AUX_RUNTIME");
+      auxiliary && *auxiliary && !loadModule(auxiliary))
+    return 2;
+  if (!loadModule(dir))
+    return 2;
   tls_total -= tls_data;
   std::map<std::string, void *> cache;
   unsigned unresolved = 0;
@@ -1195,6 +2962,8 @@ int main(int argc, char **argv) {
       p = resolve(n);
       if (!p) {
         ++unresolved;
+        if (mode == "module-map")
+          fprintf(stderr, "UNRESOLVED %s\n", n.c_str());
         p = trap(n);
       }
       cache[n] = p;
@@ -1205,6 +2974,37 @@ int main(int argc, char **argv) {
     return 2;
   fprintf(stderr, "MAPPED imports=%zu unresolved=%u tls=%lu\n", cache.size(),
           unresolved, tls_total);
+  if (mode == "module-map")
+    return 0;
+  if (mode == "module-run" || mode == "wxp2p-probe" ||
+      mode == "flurry-wxp2p-server" || mode == "flurry-credentials" ||
+      mode == "flurry-loopback" || mode == "flurry-server") {
+    setup_unwind(unwinds);
+    for (auto &[addr, name] : ctors) {
+      if (getenv("WETYPE_HOST_DEBUG"))
+        fprintf(stderr, "MODULE_CTOR %lx %s\n", addr, name.c_str());
+      ((void (*)())addr)();
+    }
+    fprintf(stderr, "MODULE_CONSTRUCTORS_RETURNED count=%zu\n", ctors.size());
+    if (mode == "module-run")
+      return 0;
+    if (mode == "wxp2p-probe")
+      return run_wxp2p_probe();
+    using Generate = void (*)(
+        void *, void (*)(void *, const FlurryLocalCredentials *, const char *));
+    ((Generate)syms.at("__ZN6flurry6Flurry23GenerateGrpcCredentialsEPvPFvS1_"
+                       "PKNS_20GrpcLocalCredentialsEPKcE"))(
+        nullptr, flurry_credentials_callback);
+    if (!flurry_credentials_ready)
+      return 2;
+    if (mode == "flurry-wxp2p-server")
+      return run_flurry_wxp2p_server();
+    if (mode == "flurry-loopback")
+      _exit(run_flurry_loopback_test() ? 0 : 2);
+    if (mode == "flurry-server")
+      return run_flurry_server();
+    return 0;
+  }
   fprintf(stderr, "VERSION %s\n",
           ((const char *(*)())syms.at("_wxime_get_version"))());
   if (mode == "version")
@@ -1312,9 +3112,9 @@ int main(int argc, char **argv) {
         strtoull(getenv("WETYPE_GROUP_ID") ? getenv("WETYPE_GROUP_ID") : "0",
                  nullptr, 10);
     const auto functions = strtoull(getenv("WETYPE_GROUP_FUNCTIONS")
-                                         ? getenv("WETYPE_GROUP_FUNCTIONS")
-                                         : "0",
-                                     nullptr, 10);
+                                        ? getenv("WETYPE_GROUP_FUNCTIONS")
+                                        : "0",
+                                    nullptr, 10);
     const auto phraseVersion = strtoull(getenv("WETYPE_HOTWORD_VERSION")
                                             ? getenv("WETYPE_HOTWORD_VERSION")
                                             : "0",

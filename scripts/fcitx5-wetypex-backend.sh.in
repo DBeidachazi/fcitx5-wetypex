@@ -39,7 +39,7 @@ if [ "$standalone" = 0 ] && [ -f "$account/identity.json" ]; then
   fi
   test -n "$model" || model=LINUX
   if [ -n "$uin" ] && [ -n "$device_code" ]; then
-    exec flock -n -E 73 "$state/backend.lock" bwrap --unshare-pid --die-with-parent \
+    exec flock -w 5 -E 73 "$state/backend.lock" bwrap --unshare-pid --die-with-parent \
       --ro-bind /usr /usr --symlink usr/lib /lib --symlink usr/lib /lib64 --symlink usr/bin /bin \
       --proc /proc --dev /dev --tmpfs /tmp --dir /etc \
       --ro-bind /etc/resolv.conf /etc/resolv.conf --ro-bind /etc/hosts /etc/hosts \
@@ -57,7 +57,7 @@ if [ "$standalone" = 0 ] && [ -f "$account/identity.json" ]; then
 fi
 
 # Offline and standalone sessions retain a private network namespace.
-exec flock -n -E 73 "$state/backend.lock" bwrap --unshare-net --unshare-pid --die-with-parent \
+exec flock -w 5 -E 73 "$state/backend.lock" bwrap --unshare-net --unshare-pid --die-with-parent \
   --ro-bind /usr /usr --symlink usr/lib /lib --symlink usr/lib /lib64 --symlink usr/bin /bin \
   --proc /proc --dev /dev --tmpfs /tmp \
   --ro-bind "$runtime" /input --ro-bind "$support" /support --bind "$state" /work \

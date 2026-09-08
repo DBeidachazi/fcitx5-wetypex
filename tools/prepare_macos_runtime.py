@@ -54,7 +54,7 @@ def sleb(data, offset, limit):
     raise ValueError('invalid SLEB128 in dyld metadata')
 
 
-def parse_bind_stream(data, start, size, segments, symbols, weak=False, lazy=False):
+def parse_bind_stream(data, start, size, segments, symbols, weak=False, lazy=False, slide=0):
     if not size:
         return []
     offset = start
@@ -68,10 +68,10 @@ def parse_bind_stream(data, start, size, segments, symbols, weak=False, lazy=Fal
     def bind():
         if segment >= len(segments) or not symbol:
             raise ValueError('incomplete dyld bind state')
-        address = (segments[segment]['vmaddr'] + address_offset) & 0xffffffffffffffff
+        address = (segments[segment]['vmaddr'] + address_offset + slide) & 0xffffffffffffffff
         value = symbols.get(symbol, 0)
         if weak and value:
-            output.append(f'OWN {address:x} {value:x} {addend}')
+            output.append(f'OWN {address:x} {value + slide:x} {addend}')
         else:
             output.append(f'BIND {address:x} {addend} {symbol}')
 
@@ -125,16 +125,46 @@ def parse_bind_stream(data, start, size, segments, symbols, weak=False, lazy=Fal
             raise ValueError(f'unsupported dyld bind opcode 0x{byte:02x}')
     return output
 
+def parse_rebase_stream(data, start, size, segments, slide):
+    if not size or not slide:return []
+    offset,limit=start,start+size;segment=address_offset=0;output=[]
+    def rebase():
+        if segment>=len(segments):raise ValueError('invalid rebase segment')
+        output.append(f'REBASE {segments[segment]["vmaddr"]+address_offset+slide:x} {slide:x}')
+    while offset<limit:
+        byte=data[offset];offset+=1;opcode,immediate=byte&0xf0,byte&0x0f
+        if opcode==0x00:break
+        if opcode==0x10:continue
+        if opcode==0x20:segment=immediate;address_offset,offset=uleb(data,offset,limit)
+        elif opcode==0x30:
+            value,offset=uleb(data,offset,limit);address_offset+=value
+        elif opcode==0x40:address_offset+=immediate*8
+        elif opcode==0x50:
+            for _ in range(immediate):rebase();address_offset+=8
+        elif opcode==0x60:
+            count,offset=uleb(data,offset,limit)
+            for _ in range(count):rebase();address_offset+=8
+        elif opcode==0x70:
+            rebase();value,offset=uleb(data,offset,limit);address_offset+=8+value
+        elif opcode==0x80:
+            count,offset=uleb(data,offset,limit);skip,offset=uleb(data,offset,limit)
+            for _ in range(count):rebase();address_offset+=8+skip
+        else:raise ValueError(f'unsupported dyld rebase opcode 0x{byte:02x}')
+    return output
+
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('binary', type=pathlib.Path)
     parser.add_argument('output', type=pathlib.Path)
+    parser.add_argument('--expected-sha256', default=EXPECTED)
+    parser.add_argument('--slide', type=lambda value:int(value,0), default=0)
+    parser.add_argument('--export-prefix', action='append', default=[])
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
 
     raw = args.binary.read_bytes()
-    if hashlib.sha256(raw).hexdigest() != EXPECTED:
+    if hashlib.sha256(raw).hexdigest() != args.expected_sha256:
         raise ValueError('unsupported original engine build')
     magic, count = struct.unpack_from('>II', raw)
     if magic != FAT_MAGIC or count >= 16:
@@ -208,34 +238,37 @@ def main():
     for segment in segments:
         if segment['name'] == '__PAGEZERO':
             continue
-        lines.append('SEG {vmaddr:x} {vmsize:x} {fileoff:x} {filesize:x} '
-                     '{initprot} {name}'.format(**segment))
+        lines.append(f'SEG {segment["vmaddr"]+args.slide:x} {segment["vmsize"]:x} '
+                     f'{segment["fileoff"]:x} {segment["filesize"]:x} '
+                     f'{segment["initprot"]} {segment["name"]}')
 
     rebase_off, rebase_size, bind_off, bind_size, weak_off, weak_size, \
         lazy_off, lazy_size, _, _ = dyld
-    del rebase_off, rebase_size
-    lines += parse_bind_stream(thin, bind_off, bind_size, segments, symbols_by_name)
+    lines += parse_rebase_stream(thin,rebase_off,rebase_size,segments,args.slide)
+    lines += parse_bind_stream(thin, bind_off, bind_size, segments, symbols_by_name,slide=args.slide)
     lines += parse_bind_stream(thin, weak_off, weak_size, segments,
-                               symbols_by_name, weak=True)
+                               symbols_by_name, weak=True, slide=args.slide)
     lines += parse_bind_stream(thin, lazy_off, lazy_size, segments,
-                               symbols_by_name, lazy=True)
+                               symbols_by_name, lazy=True, slide=args.slide)
 
     for value, name in symbol_rows:
         if value and name and (name.startswith(('_wxime_', '_business_', '_net_'))
                                or 'loguru' in name):
-            lines.append(f'SYM {value:x} {name}')
+            lines.append(f'SYM {value+args.slide:x} {name}')
+        elif value and name and any(name.startswith(p) for p in args.export_prefix):
+            lines.append(f'SYM {value+args.slide:x} {name}')
 
     imagebase = next(segment['vmaddr'] for segment in segments
                      if segment['name'] != '__PAGEZERO' and segment['fileoff'] == 0)
     for section in sections:
         if section['name'] in ('__thread_vars', '__thread_data', '__thread_bss', '__eh_frame'):
-            lines.append(f"SECTION {section['address']:x} {section['size']:x} {section['name']}")
+            lines.append(f"SECTION {section['address']+args.slide:x} {section['size']:x} {section['name']}")
         content = thin[section['offset']:section['offset'] + section['size']]
         if len(content) != section['size']:
             raise ValueError(f"truncated section {section['name']}")
         if section['name'] == '__mod_init_func':
             for (value,) in struct.iter_unpack('<Q', content):
-                lines.append(f'CTOR {value:x} {names.get(value, "unnamed")}')
+                lines.append(f'CTOR {value+args.slide:x} {names.get(value, "unnamed")}')
         if section['name'] == '__unwind_info':
             version, common_off, common_n, _, _, index_off, index_n = \
                 struct.unpack_from('<7I', content)
@@ -271,7 +304,7 @@ def main():
             for index, (function, encoding) in enumerate(unwind):
                 end = unwind[index + 1][0] if index + 1 < len(unwind) else indices[-1][0]
                 if ((encoding >> 24) & 15) == 1:
-                    lines.append(f'UNWIND {imagebase + function:x} {end - function:x} '
+                    lines.append(f'UNWIND {imagebase + function + args.slide:x} {end - function:x} '
                                  f'{encoding:x} {lsdas.get(function, 0):x}')
 
     debug_names = {value: name for value, name in symbol_rows

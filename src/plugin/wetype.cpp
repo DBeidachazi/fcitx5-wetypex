@@ -134,8 +134,7 @@ static std::string formatPinyinPreedit(const std::string &raw) {
   if (!previous.count(&graph.end()))
     return raw;
   std::vector<size_t> boundaries;
-  for (auto *node = &graph.end(); node != &graph.start();
-       node = previous[node])
+  for (auto *node = &graph.end(); node != &graph.start(); node = previous[node])
     boundaries.push_back(node->index());
   std::reverse(boundaries.begin(), boundaries.end());
   if (boundaries.size() < 2)
@@ -233,8 +232,9 @@ class WeType : public InputMethodEngine {
   uint64_t activity_ = 0;
   uint64_t restartAt_ = 0, restartBackoff_ = 250000;
   bool restartNeedsOpen_ = false;
-  uint64_t syncTick_ = 0, lastInboxVersion_ = 0;
+  uint64_t syncTick_ = 0, updateTick_ = 0, lastInboxVersion_ = 0;
   uint64_t lastVoiceVersion_ = 0;
+  uint64_t lastVModeVersion_ = 0;
   std::string inbound_, outbound_;
   std::string lastLocalClipboard_, lastRemoteClipboard_;
   bool voiceRecording_ = false, voiceHold_ = false;
@@ -259,6 +259,14 @@ class WeType : public InputMethodEngine {
       syncChild_ = -1;
     posix_spawn_file_actions_destroy(&actions);
   }
+  void stopSync() {
+    if (syncChild_ <= 0)
+      return;
+    kill(syncChild_, SIGTERM);
+    while (waitpid(syncChild_, nullptr, 0) < 0 && errno == EINTR) {
+    }
+    syncChild_ = -1;
+  }
   int pageSize_ = 5;
   int keyboard_ = 0;
   bool vertical_ = false, chinesePunctuation_ = true, slashPunctuation_ = true,
@@ -270,9 +278,9 @@ class WeType : public InputMethodEngine {
                *data = getenv("XDG_DATA_HOME"), *home = getenv("HOME");
     if (state)
       return state;
-    auto directory = data ? std::filesystem::path(data)
-                          : std::filesystem::path(home ? home : "") /
-                                ".local/share";
+    auto directory =
+        data ? std::filesystem::path(data)
+             : std::filesystem::path(home ? home : "") / ".local/share";
     return directory / "fcitx5-wetypex/state";
   }
   static char closingKey(char opening) {
@@ -316,6 +324,22 @@ class WeType : public InputMethodEngine {
       return entry->englishHalf;
     return entry->normal;
   }
+  static void commitStringAtCursor(InputContext *ic, const std::string &text,
+                                   size_t cursor) {
+    const auto length = utf8::length(text);
+    cursor = std::min(cursor, length);
+    if (ic->capabilityFlags().test(CapabilityFlag::CommitStringWithCursor)) {
+      ic->commitStringWithCursor(text, cursor);
+      return;
+    }
+
+    // XIM and some Wayland text-input clients cannot express a cursor inside
+    // committed text. Commit the complete pair first, then reproduce the
+    // original desktop behavior with ordinary cursor movement.
+    ic->commitString(text);
+    for (size_t i = cursor; i < length; ++i)
+      ic->forwardKey(Key(FcitxKey_Left));
+  }
   bool commitSymbol(InputContext *ic, State *s, char ascii, bool asciiMode) {
     const auto *entry = punctuationEntry(ascii);
     if (!entry)
@@ -332,7 +356,7 @@ class WeType : public InputMethodEngine {
     auto [left, right] = splitPair(mapped);
     if (entry->pairType && !right.empty()) {
       if (*config_.input->symbolAutoPair) {
-        ic->commitStringWithCursor(mapped, 1);
+        commitStringAtCursor(ic, mapped, 1);
         s->pendingPairKey = closingKey(ascii);
         s->pendingPairRight = right;
       } else if (entry->pairType == 2) {
@@ -367,6 +391,10 @@ class WeType : public InputMethodEngine {
     f.read(bytes.data(), bytes.size());
     bytes.resize(f.gcount());
     auto j = bytes.size() > 16384 ? wire::Json{} : wire::parse(bytes);
+    auto boolSetting = [&](const char *name, bool fallback) {
+      auto *value = wire::get(j.get(), name);
+      return value ? bool(json_object_get_boolean(value)) : fallback;
+    };
     pageSize_ = std::clamp(int(wire::number(j.get(), "page_size", 5)), 3, 9);
     keyboard_ = wire::number(j.get(), "keyboard", 0) == 5 ? 5 : 0;
     vertical_ = json_object_get_boolean(wire::get(j.get(), "vertical"));
@@ -375,8 +403,7 @@ class WeType : public InputMethodEngine {
     auto *slash = wire::get(j.get(), "slash_punctuation");
     slashPunctuation_ = !slash || json_object_get_boolean(slash);
     auto *symbolChange = wire::get(j.get(), "symbol_auto_change");
-    symbolAutoChange_ =
-        !symbolChange || json_object_get_boolean(symbolChange);
+    symbolAutoChange_ = !symbolChange || json_object_get_boolean(symbolChange);
     clipboardEnabled_ =
         json_object_get_boolean(wire::get(j.get(), "clipboard_enabled"));
     networkEnabled_ =
@@ -387,17 +414,27 @@ class WeType : public InputMethodEngine {
                          : mode == "double_pinyin"
                              ? wetype_config::InputMode::DoublePinyin
                              : wetype_config::InputMode::Pinyin);
-    input->wubi.setValue(static_cast<wetype_config::WubiScheme>(std::clamp(
-        int(wire::number(j.get(), "wubi_solution", 0)), 0, 2)));
+    input->wubi.setValue(static_cast<wetype_config::WubiScheme>(
+        std::clamp(int(wire::number(j.get(), "wubi_solution", 0)), 0, 2)));
+    input->wubiPinyin.setValue(boolSetting("wubi_pinyin", false));
+    input->wubiUniqueCommit.setValue(boolSetting("wubi_unique_commit", false));
+    input->wubiNextCommit.setValue(boolSetting("wubi_next_commit", false));
+    input->wubiWildcardComment.setValue(
+        boolSetting("wubi_wildcard_comment", false));
     input->doublePinyin.setValue(
         static_cast<wetype_config::DoublePinyinScheme>(std::clamp(
             int(wire::number(j.get(), "double_pinyin_scheme", 0)), 0, 6)));
-    input->smartInput.setValue(!wire::get(j.get(), "smart_input") ||
-                               json_object_get_boolean(
-                                   wire::get(j.get(), "smart_input")));
+    input->smartInput.setValue(
+        !wire::get(j.get(), "smart_input") ||
+        json_object_get_boolean(wire::get(j.get(), "smart_input")));
     input->emojiRecommend.setValue(
         !wire::get(j.get(), "emoji_recommend") ||
         json_object_get_boolean(wire::get(j.get(), "emoji_recommend")));
+    input->wechatEmoji.setValue(boolSetting("wechat_emoji", true));
+    input->normalEmoji.setValue(boolSetting("normal_emoji", true));
+    input->kaomoji.setValue(boolSetting("kaomoji", true));
+    input->largeEmoji.setValue(boolSetting("large_emoji", true));
+    input->symbolEmoji.setValue(boolSetting("symbol_emoji", true));
     input->slashPunctuation.setValue(slashPunctuation_);
     input->symbolAutoChange.setValue(
         !wire::get(j.get(), "symbol_auto_change") ||
@@ -410,19 +447,26 @@ class WeType : public InputMethodEngine {
         wire::str(j.get(), "default_language") == "english"
             ? wetype_config::DefaultLanguage::English
             : wetype_config::DefaultLanguage::Chinese);
-    input->fuzzyNl.setValue(json_object_get_boolean(wire::get(j.get(), "fuzzy_nl")));
-    input->fuzzyRl.setValue(json_object_get_boolean(wire::get(j.get(), "fuzzy_rl")));
-    input->fuzzyHf.setValue(json_object_get_boolean(wire::get(j.get(), "fuzzy_hf")));
-    input->fuzzyGk.setValue(json_object_get_boolean(wire::get(j.get(), "fuzzy_gk")));
+    input->fuzzyNl.setValue(
+        json_object_get_boolean(wire::get(j.get(), "fuzzy_nl")));
+    input->fuzzyRl.setValue(
+        json_object_get_boolean(wire::get(j.get(), "fuzzy_rl")));
+    input->fuzzyHf.setValue(
+        json_object_get_boolean(wire::get(j.get(), "fuzzy_hf")));
+    input->fuzzyGk.setValue(
+        json_object_get_boolean(wire::get(j.get(), "fuzzy_gk")));
     input->fuzzyAnAng.setValue(
         json_object_get_boolean(wire::get(j.get(), "fuzzy_an_ang")));
     input->fuzzyIanIang.setValue(
         json_object_get_boolean(wire::get(j.get(), "fuzzy_ian_iang")));
     input->fuzzyUanUang.setValue(
         json_object_get_boolean(wire::get(j.get(), "fuzzy_uan_uang")));
-    input->fuzzyCCh.setValue(json_object_get_boolean(wire::get(j.get(), "fuzzy_c_ch")));
-    input->fuzzySSh.setValue(json_object_get_boolean(wire::get(j.get(), "fuzzy_s_sh")));
-    input->fuzzyZZh.setValue(json_object_get_boolean(wire::get(j.get(), "fuzzy_z_zh")));
+    input->fuzzyCCh.setValue(
+        json_object_get_boolean(wire::get(j.get(), "fuzzy_c_ch")));
+    input->fuzzySSh.setValue(
+        json_object_get_boolean(wire::get(j.get(), "fuzzy_s_sh")));
+    input->fuzzyZZh.setValue(
+        json_object_get_boolean(wire::get(j.get(), "fuzzy_z_zh")));
     input->fuzzyHuiFei.setValue(
         json_object_get_boolean(wire::get(j.get(), "fuzzy_hui_fei")));
     input->fuzzyEnEng.setValue(
@@ -445,8 +489,8 @@ class WeType : public InputMethodEngine {
     phrases->clipboard.setValue(clipboardEnabled_);
     auto *appearance = config_.appearance.mutableValue();
     appearance->pageSize.setValue(pageSize_);
-    appearance->candidateSize.setValue(std::clamp(
-        int(wire::number(j.get(), "candidate_size", 13)), 10, 18));
+    appearance->candidateSize.setValue(
+        std::clamp(int(wire::number(j.get(), "candidate_size", 13)), 10, 18));
     appearance->vertical.setValue(vertical_);
     appearance->theme.setValue(static_cast<wetype_config::ThemeMode>(
         std::clamp(int(wire::number(j.get(), "theme_mode", 0)), 0, 2)));
@@ -457,10 +501,6 @@ class WeType : public InputMethodEngine {
         json_object_get_boolean(wire::get(j.get(), "device_dictionary_sync")));
     devices->phraseSync.setValue(
         json_object_get_boolean(wire::get(j.get(), "device_phrase_sync")));
-    auto boolSetting = [&](const char *name, bool fallback) {
-      auto *value = wire::get(j.get(), name);
-      return value ? bool(json_object_get_boolean(value)) : fallback;
-    };
     auto *voice = config_.voice.mutableValue();
     voice->launchShortcut.setValue(boolSetting("voice_launch_shortcut", true));
     voice->holdShortcut.setValue(boolSetting("voice_hold_shortcut", true));
@@ -473,23 +513,34 @@ class WeType : public InputMethodEngine {
         stringSetting("voice_launch_key", "Control+Super+Shift_L")));
     voice->holdKey.setValue(Key::keyListFromString(
         stringSetting("voice_hold_key", "Control+Super_L")));
-    voice->microphone.setValue(
-        stringSetting("voice_microphone", "自动检测"));
+    voice->microphone.setValue(stringSetting("voice_microphone", "自动检测"));
+    const auto voicePunctuation =
+        stringSetting("voice_punctuation", "智能标点");
     voice->punctuation.setValue(
-        stringSetting("voice_punctuation", "智能标点"));
+        voicePunctuation == "添加完整标点"
+            ? wetype_config::VoicePunctuationMode::Full
+        : voicePunctuation == "句末不加句号"
+            ? wetype_config::VoicePunctuationMode::NoPeriod
+        : voicePunctuation == "空格替换标点"
+            ? wetype_config::VoicePunctuationMode::Spaces
+            : wetype_config::VoicePunctuationMode::Smart);
     auto *shortcuts = config_.shortcuts.mutableValue();
     shortcuts->shiftSwitch.setValue(boolSetting("shift_switch", true));
     shortcuts->ctrlSwitch.setValue(boolSetting("ctrl_switch", false));
     shortcuts->aiAssistant.setValue(boolSetting("ai_assistant", true));
     shortcuts->vMode.setValue(boolSetting("v_mode", true));
     shortcuts->halfFull.setValue(boolSetting("half_full_switch", false));
-    shortcuts->punctuationSwitch.setValue(boolSetting("punctuation_switch", true));
-    shortcuts->traditionalSwitch.setValue(boolSetting("traditional_switch", false));
+    shortcuts->punctuationSwitch.setValue(
+        boolSetting("punctuation_switch", true));
+    shortcuts->traditionalSwitch.setValue(
+        boolSetting("traditional_switch", false));
     shortcuts->pageMinusEqual.setValue(boolSetting("page_minus_equal", true));
     shortcuts->pageBrackets.setValue(boolSetting("page_brackets", true));
-    shortcuts->pageCommaPeriod.setValue(boolSetting("page_comma_period", false));
+    shortcuts->pageCommaPeriod.setValue(
+        boolSetting("page_comma_period", false));
     shortcuts->pageShiftTab.setValue(boolSetting("page_shift_tab", false));
-    shortcuts->selectSemicolonQuote.setValue(boolSetting("select_semicolon_quote", false));
+    shortcuts->selectSemicolonQuote.setValue(
+        boolSetting("select_semicolon_quote", false));
     shortcuts->selectCtrl.setValue(boolSetting("select_ctrl", false));
     auto loadKeys = [&](auto &option, const char *name) {
       auto value = wire::str(j.get(), name);
@@ -526,8 +577,7 @@ class WeType : public InputMethodEngine {
     if (!json || !json_object_is_type(json.get(), json_type_object))
       json = wire::object();
     const auto &input = *config_.input;
-    auto mode = *input.mode == wetype_config::InputMode::Wubi
-                    ? "wubi"
+    auto mode = *input.mode == wetype_config::InputMode::Wubi ? "wubi"
                 : *input.mode == wetype_config::InputMode::DoublePinyin
                     ? "double_pinyin"
                     : "pinyin";
@@ -535,10 +585,19 @@ class WeType : public InputMethodEngine {
     wire::put(json.get(), "keyboard",
               int64_t(*input.mode == wetype_config::InputMode::Wubi ? 5 : 0));
     wire::put(json.get(), "wubi_solution", int64_t(*input.wubi));
-    wire::put(json.get(), "double_pinyin_scheme",
-              int64_t(*input.doublePinyin));
+    wire::put(json.get(), "wubi_pinyin", bool(*input.wubiPinyin));
+    wire::put(json.get(), "wubi_unique_commit", bool(*input.wubiUniqueCommit));
+    wire::put(json.get(), "wubi_next_commit", bool(*input.wubiNextCommit));
+    wire::put(json.get(), "wubi_wildcard_comment",
+              bool(*input.wubiWildcardComment));
+    wire::put(json.get(), "double_pinyin_scheme", int64_t(*input.doublePinyin));
     wire::put(json.get(), "smart_input", bool(*input.smartInput));
     wire::put(json.get(), "emoji_recommend", bool(*input.emojiRecommend));
+    wire::put(json.get(), "wechat_emoji", bool(*input.wechatEmoji));
+    wire::put(json.get(), "normal_emoji", bool(*input.normalEmoji));
+    wire::put(json.get(), "kaomoji", bool(*input.kaomoji));
+    wire::put(json.get(), "large_emoji", bool(*input.largeEmoji));
+    wire::put(json.get(), "symbol_emoji", bool(*input.symbolEmoji));
     wire::put(json.get(), "slash_punctuation", bool(*input.slashPunctuation));
     wire::put(json.get(), "symbol_auto_change", bool(*input.symbolAutoChange));
     wire::put(json.get(), "symbol_auto_pair", bool(*input.symbolAutoPair));
@@ -569,8 +628,7 @@ class WeType : public InputMethodEngine {
     wire::put(json.get(), "fuzzy_eng_ong", bool(*input.fuzzyEngOng));
     const auto &appearance = *config_.appearance;
     wire::put(json.get(), "page_size", int64_t(*appearance.pageSize));
-    wire::put(json.get(), "candidate_size",
-              int64_t(*appearance.candidateSize));
+    wire::put(json.get(), "candidate_size", int64_t(*appearance.candidateSize));
     wire::put(json.get(), "vertical", bool(*appearance.vertical));
     wire::put(json.get(), "theme_mode", int64_t(*appearance.theme));
     wire::put(json.get(), "clipboard_enabled",
@@ -590,20 +648,32 @@ class WeType : public InputMethodEngine {
     wire::put(json.get(), "voice_hold_key",
               Key::keyListToString(*voice.holdKey));
     wire::put(json.get(), "voice_microphone", *voice.microphone);
-    wire::put(json.get(), "voice_punctuation", *voice.punctuation);
+    const char *punctuation =
+        *voice.punctuation == wetype_config::VoicePunctuationMode::Full
+            ? "添加完整标点"
+        : *voice.punctuation == wetype_config::VoicePunctuationMode::NoPeriod
+            ? "句末不加句号"
+        : *voice.punctuation == wetype_config::VoicePunctuationMode::Spaces
+            ? "空格替换标点"
+            : "智能标点";
+    wire::put(json.get(), "voice_punctuation", std::string(punctuation));
     const auto &shortcuts = *config_.shortcuts;
     wire::put(json.get(), "shift_switch", bool(*shortcuts.shiftSwitch));
     wire::put(json.get(), "ctrl_switch", bool(*shortcuts.ctrlSwitch));
     wire::put(json.get(), "ai_assistant", bool(*shortcuts.aiAssistant));
     wire::put(json.get(), "v_mode", bool(*shortcuts.vMode));
     wire::put(json.get(), "half_full_switch", bool(*shortcuts.halfFull));
-    wire::put(json.get(), "punctuation_switch", bool(*shortcuts.punctuationSwitch));
-    wire::put(json.get(), "traditional_switch", bool(*shortcuts.traditionalSwitch));
+    wire::put(json.get(), "punctuation_switch",
+              bool(*shortcuts.punctuationSwitch));
+    wire::put(json.get(), "traditional_switch",
+              bool(*shortcuts.traditionalSwitch));
     wire::put(json.get(), "page_minus_equal", bool(*shortcuts.pageMinusEqual));
     wire::put(json.get(), "page_brackets", bool(*shortcuts.pageBrackets));
-    wire::put(json.get(), "page_comma_period", bool(*shortcuts.pageCommaPeriod));
+    wire::put(json.get(), "page_comma_period",
+              bool(*shortcuts.pageCommaPeriod));
     wire::put(json.get(), "page_shift_tab", bool(*shortcuts.pageShiftTab));
-    wire::put(json.get(), "select_semicolon_quote", bool(*shortcuts.selectSemicolonQuote));
+    wire::put(json.get(), "select_semicolon_quote",
+              bool(*shortcuts.selectSemicolonQuote));
     wire::put(json.get(), "select_ctrl", bool(*shortcuts.selectCtrl));
     auto saveKeys = [&](const char *name, const auto &option) {
       wire::put(json.get(), name, Key::keyListToString(*option));
@@ -654,8 +724,8 @@ class WeType : public InputMethodEngine {
                              : "False"},
         {"UseAccentColor", "False"},
         {"PreferTextIcon", "False"},
-        {"Font", "Noto Sans CJK SC " +
-                     std::to_string(*appearance.candidateSize)}};
+        {"Font",
+         "Noto Sans CJK SC " + std::to_string(*appearance.candidateSize)}};
     for (auto &[key, value] : values) {
       bool found = false;
       for (auto &existing : lines)
@@ -721,14 +791,15 @@ class WeType : public InputMethodEngine {
               continue;
             std::string text = json_object_get_string(item);
             if (text.size() <= 16384 &&
-                std::find(entries.begin(), entries.end(), text) == entries.end())
+                std::find(entries.begin(), entries.end(), text) ==
+                    entries.end())
               entries.push_back(std::move(text));
           }
       }
       auto array = wire::Json(json_object_new_array());
       for (const auto &entry : entries)
-        json_object_array_add(
-            array.get(), json_object_new_string_len(entry.data(), entry.size()));
+        json_object_array_add(array.get(), json_object_new_string_len(
+                                               entry.data(), entry.size()));
       auto temporary = path;
       temporary += ".tmp";
       std::ofstream output(temporary, std::ios::trunc);
@@ -815,6 +886,42 @@ class WeType : public InputMethodEngine {
         break;
       }
   }
+  void receiveVModeAction() {
+    auto path = stateDirectory() / "vmode-action.json";
+    std::ifstream input(path);
+    std::string bytes((std::istreambuf_iterator<char>(input)), {});
+    if (bytes.empty() || bytes.size() > 65536)
+      return;
+    auto message = wire::parse(bytes);
+    const auto version = uint64_t(wire::number(message.get(), "version"));
+    const auto session = uint64_t(wire::number(message.get(), "session"));
+    if (!version || version <= lastVModeVersion_)
+      return;
+    lastVModeVersion_ = version;
+    std::error_code error;
+    std::filesystem::remove(path, error);
+    auto it = contexts_.find(session);
+    if (it == contexts_.end())
+      return;
+    auto *ic = it->second.get();
+    if (!ic || !ic->hasFocus())
+      return;
+    const auto action = wire::str(message.get(), "action");
+    if (action != "commit")
+      return;
+    const auto text = wire::str(message.get(), "text");
+    if (text.empty() || text.size() > 65536)
+      return;
+    auto *s = state(ic);
+    send(ic, "reset");
+    s->vMode = false;
+    s->preedit.clear();
+    s->cursor = 0;
+    clearDisplayState(s);
+    ic->inputPanel().reset();
+    ic->commitString(text);
+    panel(ic, s);
+  }
   State *state(InputContext *ic) {
     auto *s = ic->propertyFor(&factory_);
     contexts_[s->id] = ic->watch();
@@ -835,10 +942,9 @@ class WeType : public InputMethodEngine {
     // Windows 2.1.3.18 shows composition inline in the target application;
     // the candidate bar contains candidates only.
     ic->inputPanel().setPreedit(Text());
-    ic->inputPanel().setAuxDown(
-        Text(failed_   ? "WeTypeX 核心正在恢复…"
-             : !ready_ ? "WeTypeX 核心启动中…"
-                       : ""));
+    ic->inputPanel().setAuxDown(Text(failed_   ? "WeTypeX 核心正在恢复…"
+                                     : !ready_ ? "WeTypeX 核心启动中…"
+                                               : ""));
     ic->updatePreedit();
     ic->updateUserInterface(UserInterfaceComponent::InputPanel);
   }
@@ -1005,14 +1111,26 @@ class WeType : public InputMethodEngine {
     wire::put(json.get(), "keyboard", int64_t(keyboard_));
     const auto &inputConfig = *config_.input;
     static const int doubleSchemes[] = {5, 1, 2, 3, 4, 6, 7};
-    wire::put(json.get(), "double_scheme",
-              int64_t(*inputConfig.mode == wetype_config::InputMode::DoublePinyin
-                          ? doubleSchemes[int(*inputConfig.doublePinyin)]
-                          : 0));
+    wire::put(
+        json.get(), "double_scheme",
+        int64_t(*inputConfig.mode == wetype_config::InputMode::DoublePinyin
+                    ? doubleSchemes[int(*inputConfig.doublePinyin)]
+                    : 0));
     wire::put(json.get(), "wubi_solution", int64_t(*inputConfig.wubi));
+    wire::put(json.get(), "wubi_pinyin", bool(*inputConfig.wubiPinyin));
+    wire::put(json.get(), "wubi_unique_commit",
+              bool(*inputConfig.wubiUniqueCommit));
+    wire::put(json.get(), "wubi_next_commit",
+              bool(*inputConfig.wubiNextCommit));
+    wire::put(json.get(), "wubi_wildcard_comment",
+              bool(*inputConfig.wubiWildcardComment));
     wire::put(json.get(), "smart_input", bool(*inputConfig.smartInput));
-    wire::put(json.get(), "emoji_recommend",
-              bool(*inputConfig.emojiRecommend));
+    wire::put(json.get(), "emoji_recommend", bool(*inputConfig.emojiRecommend));
+    wire::put(json.get(), "wechat_emoji", bool(*inputConfig.wechatEmoji));
+    wire::put(json.get(), "normal_emoji", bool(*inputConfig.normalEmoji));
+    wire::put(json.get(), "kaomoji", bool(*inputConfig.kaomoji));
+    wire::put(json.get(), "large_emoji", bool(*inputConfig.largeEmoji));
+    wire::put(json.get(), "symbol_emoji", bool(*inputConfig.symbolEmoji));
     wire::put(json.get(), "v_mode", bool(*config_.shortcuts->vMode));
     wire::put(json.get(), "fuzzy_nl", bool(*inputConfig.fuzzyNl));
     wire::put(json.get(), "fuzzy_rl", bool(*inputConfig.fuzzyRl));
@@ -1055,7 +1173,8 @@ class WeType : public InputMethodEngine {
       if (restartNeedsOpen_) {
         restartNeedsOpen_ = false;
         for (auto &[id, ref] : contexts_)
-          if (auto *ic = ref.get(); ic && ic->hasFocus() &&
+          if (auto *ic = ref.get();
+              ic && ic->hasFocus() &&
               !ic->capabilityFlags().test(CapabilityFlag::Password) &&
               !ic->capabilityFlags().test(CapabilityFlag::Sensitive))
             send(ic, "open");
@@ -1091,7 +1210,7 @@ class WeType : public InputMethodEngine {
         wire::number(j.get(), "cursor_commit_position", -1);
     if (!cursorCommit.empty() && cursorCommitPosition >= 0 &&
         size_t(cursorCommitPosition) <= utf8::length(cursorCommit))
-      ic->commitStringWithCursor(cursorCommit, size_t(cursorCommitPosition));
+      commitStringAtCursor(ic, cursorCommit, size_t(cursorCommitPosition));
     if (seq != s->seq)
       return;
     s->preedit = wire::str(j.get(), "preedit");
@@ -1121,8 +1240,9 @@ class WeType : public InputMethodEngine {
     s->revision = wire::number(j.get(), "revision");
     auto list = std::make_unique<CommonCandidateList>();
     list->setPageSize(pageSize_);
-    list->setSelectionKey({Key("1"), Key("2"), Key("3"), Key("4"), Key("5"),
-                           Key("6"), Key("7"), Key("8"), Key("9")});
+    // The Windows candidate bar renders the page-local digit as part of each
+    // candidate ("1测试"), without Fcitx's default "1. 测试" label.
+    list->setSelectionKey({});
     list->setLayoutHint(vertical_ ? CandidateLayoutHint::Vertical
                                   : CandidateLayoutHint::Horizontal);
     auto *candidates = wire::get(j.get(), "candidates");
@@ -1131,8 +1251,11 @@ class WeType : public InputMethodEngine {
            i < std::min(size_t(50), json_object_array_length(candidates));
            i++) {
         auto *v = json_object_array_get_idx(candidates, i);
-        if (json_object_is_type(v, json_type_string))
-          list->append<Word>(this, json_object_get_string(v), i, s->revision);
+        if (json_object_is_type(v, json_type_string)) {
+          std::string display = std::to_string(i % pageSize_ + 1);
+          display += json_object_get_string(v);
+          list->append<Word>(this, std::move(display), i, s->revision);
+        }
       }
     if (list->totalSize()) {
       list->setGlobalCursorIndex(0);
@@ -1148,7 +1271,8 @@ public:
           return new State(++nextId_, ic);
         }) {
     reloadSettings();
-    instance_->inputContextManager().registerProperty("wetypexState", &factory_);
+    instance_->inputContextManager().registerProperty("wetypexState",
+                                                      &factory_);
     settingsAction_.setShortText("WeTypeX 设置");
     settingsAction_.setIcon("fcitx5-wetypex");
     settingsAction_.registerAction("wetypex-settings",
@@ -1172,7 +1296,7 @@ public:
               }
             }
           if (child_ > 0 && (!ready_ || pending) &&
-              time >= activity_ + (ready_ ? 30000000 : 60000000))
+              time >= activity_ + (ready_ ? 30000000 : 180000000))
             fail();
           if (child_ <= 0 && restartAt_ && time >= restartAt_) {
             restartAt_ = 0;
@@ -1183,6 +1307,12 @@ public:
             syncTick_ = time;
             receiveRemoteClipboard();
             receiveVoice();
+            receiveVModeAction();
+          }
+          if (networkEnabled_ && *config_.update->autoUpdate &&
+              time >= updateTick_ + 3600000000ULL) {
+            updateTick_ = time;
+            startProcess({WETYPE_UPDATE});
           }
           source->setTime(time + 100000);
           source->setEnabled(true);
@@ -1202,7 +1332,12 @@ public:
     config_.load(raw, true);
     saveNativeConfig();
     applyAppearance();
-    applyDeviceFunctions();
+    if (networkEnabled_) {
+      applyDeviceFunctions();
+      startSync();
+    } else {
+      stopSync();
+    }
     stop();
     if (!start()) {
       failed_ = true;
@@ -1215,6 +1350,10 @@ public:
   }
   void reloadConfig() override {
     reloadSettings();
+    if (networkEnabled_)
+      startSync();
+    else
+      stopSync();
     stop();
     if (!start()) {
       failed_ = true;
@@ -1224,11 +1363,7 @@ public:
   ~WeType() override {
     timer_.reset();
     stop();
-    if (syncChild_ > 0) {
-      kill(syncChild_, SIGTERM);
-      while (waitpid(syncChild_, nullptr, 0) < 0 && errno == EINTR) {
-      }
-    }
+    stopSync();
   }
   void activate(const InputMethodEntry &, InputContextEvent &e) override {
     reloadSettings();
@@ -1289,14 +1424,15 @@ public:
     auto *ic = e.inputContext();
     auto *s = state(ic);
     auto sym = key.sym();
-    const bool shiftModifier = sym == FcitxKey_Shift_L || sym == FcitxKey_Shift_R;
-    const bool ctrlModifier = sym == FcitxKey_Control_L || sym == FcitxKey_Control_R;
+    const bool shiftModifier =
+        sym == FcitxKey_Shift_L || sym == FcitxKey_Shift_R;
+    const bool ctrlModifier =
+        sym == FcitxKey_Control_L || sym == FcitxKey_Control_R;
     if (e.isRelease()) {
       auto releasedConfiguredKey = [&](const KeyList &keys) {
-        return std::any_of(keys.begin(), keys.end(),
-                           [&](const Key &candidate) {
-                             return key.isReleaseOfModifier(candidate);
-                           });
+        return std::any_of(keys.begin(), keys.end(), [&](const Key &candidate) {
+          return key.isReleaseOfModifier(candidate);
+        });
       };
       if (voiceRecording_ && voiceHold_ &&
           releasedConfiguredKey(*config_.voice->holdKey)) {
@@ -1339,7 +1475,7 @@ public:
       }
       return;
     }
-    if (*config_.voice->launchShortcut &&
+    if (networkEnabled_ && *config_.voice->launchShortcut &&
         key.checkKeyList(*config_.voice->launchKey)) {
       if (!voiceRecording_)
         startVoice(ic, false);
@@ -1348,7 +1484,7 @@ public:
       e.filterAndAccept();
       return;
     }
-    if (!voiceRecording_ && *config_.voice->holdShortcut &&
+    if (networkEnabled_ && !voiceRecording_ && *config_.voice->holdShortcut &&
         key.checkKeyList(*config_.voice->holdKey)) {
       startVoice(ic, true);
       e.filterAndAccept();
@@ -1394,12 +1530,14 @@ public:
     if (ic->capabilityFlags().test(CapabilityFlag::Password) ||
         ic->capabilityFlags().test(CapabilityFlag::Sensitive))
       return;
-    if (!s->vMode && s->preedit.empty() && *config_.shortcuts->aiAssistant &&
+    if (networkEnabled_ && !s->vMode && s->preedit.empty() &&
+        *config_.shortcuts->aiAssistant &&
         key.checkKeyList(*config_.shortcuts->aiAssistantKeys)) {
       const auto &surrounding = ic->surroundingText();
       if (surrounding.isValid() && surrounding.cursor()) {
         const auto &all = surrounding.text();
-        auto byteCursor = utf8::ncharByteLength(all.begin(), surrounding.cursor());
+        auto byteCursor =
+            utf8::ncharByteLength(all.begin(), surrounding.cursor());
         if (byteCursor > 0 && size_t(byteCursor) <= all.size()) {
           std::string question = all.substr(0, size_t(byteCursor));
           constexpr size_t MaxContextBytes = 4096;
@@ -1466,6 +1604,10 @@ public:
       clearDisplayState(s);
       ic->inputPanel().setCandidateList(nullptr);
       panel(ic, s);
+      const auto &rect = ic->cursorRect();
+      startProcess({WETYPE_VMODE, std::to_string(s->id),
+                    std::to_string(rect.left()),
+                    std::to_string(rect.bottom())});
       e.filterAndAccept();
       return;
     }
@@ -1547,16 +1689,14 @@ public:
         (*config_.shortcuts->pageCommaPeriod && sym == FcitxKey_period) ||
         (*config_.shortcuts->pageShiftTab &&
          !key.states().test(KeyState::Shift) && sym == FcitxKey_Tab);
-    bool pageUp = sym == FcitxKey_Page_Up ||
-                  key.checkKeyList(*config_.shortcuts->previousPageKeys) ||
-                  (*config_.shortcuts->pageMinusEqual &&
-                   sym == FcitxKey_minus) ||
-                  (*config_.shortcuts->pageBrackets &&
-                   sym == FcitxKey_bracketleft) ||
-                  (*config_.shortcuts->pageCommaPeriod &&
-                   sym == FcitxKey_comma) ||
-                  (*config_.shortcuts->pageShiftTab &&
-                   key.states().test(KeyState::Shift) && sym == FcitxKey_Tab);
+    bool pageUp =
+        sym == FcitxKey_Page_Up ||
+        key.checkKeyList(*config_.shortcuts->previousPageKeys) ||
+        (*config_.shortcuts->pageMinusEqual && sym == FcitxKey_minus) ||
+        (*config_.shortcuts->pageBrackets && sym == FcitxKey_bracketleft) ||
+        (*config_.shortcuts->pageCommaPeriod && sym == FcitxKey_comma) ||
+        (*config_.shortcuts->pageShiftTab &&
+         key.states().test(KeyState::Shift) && sym == FcitxKey_Tab);
     if (composing && (pageDown || pageUp)) {
       if (list) {
         if (pageDown) {

@@ -12,9 +12,9 @@ jobs:
     steps:
       - name: 安装构建依赖
         run: >-
-          pacman -Syu --noconfirm git cmake clang boost fcitx5 libime libc++
+          pacman -Syu --noconfirm git cmake clang boost fcitx5 fcitx5-qt libime libc++
           json-c curl bubblewrap util-linux python qt6-base qt6-svg
-          qt6-webengine pipewire ffmpeg wl-clipboard
+          qt6-webengine pipewire ffmpeg wl-clipboard libnotify polkit
       - uses: actions/checkout@v4
       - name: 配置
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr

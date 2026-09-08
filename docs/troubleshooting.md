@@ -61,6 +61,22 @@ fcitx5-wetypex-setup --archive /path/to/WeType_2.2.3_657.zip --icons-only
 
 Qt WebEngine 无法启动时，检查 `qt6-webengine`、图形驱动和桌面沙箱配置。AI 结果保存在 `~/.local/share/fcitx5-wetypex/ai/`，其中可能含有用户问题，不应直接公开。
 
+## 隔空传送无法连接
+
+先运行：
+
+```bash
+fcitx5-wetypex-setup --check
+```
+
+检查结果应同时包含 `flurry` 与 `wxp2p`，并且 `core_ready` 为 `true`。原版 WXP2P 会依次尝试局域网直连、公网打洞和腾讯中继，因此两台设备不必位于同一局域网。受限网络需要允许出站 UDP，以及到上游中继的 TCP 80、8080 和 16285 端口。
+
+传输日志位于 `~/.local/share/fcitx5-wetypex/state/transfer/transport.log`。手机点击重试时桌面窗口无需关闭；WeTypeX 会继续轮询同一传输码，并在官方服务返回新调度数据后重建会话。若只缺少传输图标或连接示意图，可从同一官方安装包重新提取：
+
+```bash
+fcitx5-wetypex-setup --archive /path/to/WeType_2.2.3_657.zip --icons-only
+```
+
 ## 重新配对
 
 普通故障不要删除身份文件。确需重置时先备份：

@@ -21,8 +21,21 @@ struct CapiNetworkLoginArgument {
 };
 static_assert(sizeof(CapiNetworkLoginArgument) == 72);
 
-static void network_login_service(bool exit_after = true, bool emit_result = true,
+static void network_login_service(bool exit_after = true,
+                                  bool emit_result = true,
                                   bool wait_for_transport = true) {
+  const char *uin = getenv("WETYPE_CORE_UIN");
+  if (uin && *uin) {
+    const size_t uinLength = strlen(uin);
+    const bool numeric =
+        uinLength <= 31 &&
+        std::all_of(uin, uin + uinLength, [](unsigned char value) {
+          return value >= '0' && value <= '9';
+        });
+    if (numeric)
+      ((bool (*)(const char *, uint32_t))syms.at("_wxime_reset_user_id"))(
+          uin, uint32_t(uinLength));
+  }
   const char *seed = getenv("WETYPE_DEVICE_MODEL");
   if (!seed || !*seed)
     seed = "LINUX";
@@ -46,16 +59,14 @@ static void network_login_service(bool exit_after = true, bool emit_result = tru
   ((void (*)(CapiNetworkLoginArgument))syms.at("_wxime_network_login"))(login);
   auto stateFn = ((int (*)())dlsym(RTLD_DEFAULT, "wcwss_bridge_state"));
   auto errorFn = ((int (*)())dlsym(RTLD_DEFAULT, "wcwss_bridge_error"));
-  unsigned waits = wait_for_transport ? (getenv("WETYPE_NETWORK_LIVE") ? 120 : 3)
-                                      : 0;
+  unsigned waits =
+      wait_for_transport ? (getenv("WETYPE_NETWORK_LIVE") ? 120 : 3) : 0;
   while (waits-- && !stateFn())
     usleep(100000);
   if (wait_for_transport && getenv("WETYPE_NETWORK_LIVE") && stateFn() == 1)
     usleep(2000000);
-  auto calls =
-      ((unsigned (*)())dlsym(RTLD_DEFAULT, "wcwss_bridge_calls"))();
-  auto sends =
-      ((unsigned (*)())dlsym(RTLD_DEFAULT, "wcwss_bridge_sends"))();
+  auto calls = ((unsigned (*)())dlsym(RTLD_DEFAULT, "wcwss_bridge_calls"))();
+  auto sends = ((unsigned (*)())dlsym(RTLD_DEFAULT, "wcwss_bridge_sends"))();
   auto receives =
       ((unsigned (*)())dlsym(RTLD_DEFAULT, "wcwss_bridge_receives"))();
   if (emit_result) {
@@ -157,6 +168,68 @@ static void protobuf_uint(std::vector<unsigned char> &output, unsigned field,
   protobuf_varint(output, field << 3);
   protobuf_varint(output, value);
 }
+static std::vector<unsigned char> p2p_link_info_from_file(const char *path,
+                                                          const char *model) {
+  // WTConnectionPlan parses link_net_info as JSON. In a P2P-only session the
+  // official iOS client sends exactly device_name and preferred_client. The
+  // QR-code host must prefer the server role so the scanning phone can be the
+  // preferred client.
+  bool preferredClient = false;
+  std::string ip;
+  if (path && *path) {
+    std::ifstream stream(path);
+    std::string json((std::istreambuf_iterator<char>(stream)), {});
+    auto info = wire::parse(json);
+    if (auto *value = wire::get(info.get(), "preferred_client");
+        value && json_object_is_type(value, json_type_boolean))
+      preferredClient = json_object_get_boolean(value);
+    ip = wire::str(info.get(), "ip");
+  }
+  auto link = wire::object();
+  auto *lan = json_object_new_array();
+  if (!ip.empty() && ip != "0.0.0.0" && ip != "127.0.0.1")
+    json_object_array_add(lan, json_object_new_string(ip.c_str()));
+  json_object_object_add(link.get(), "lan", lan);
+  wire::put(link.get(), "device_name", model ? model : "LINUX");
+  wire::boolean(link.get(), "preferred_client", preferredClient);
+  auto serialized = wire::dump(link.get());
+  return {serialized.begin(), serialized.end()};
+}
+static std::vector<unsigned char> p2p_grpc_info_from_file(const char *path,
+                                                          const char *model) {
+  if (!path || !*path)
+    return {};
+  std::ifstream stream(path);
+  std::string json((std::istreambuf_iterator<char>(stream)), {});
+  auto info = wire::parse(json);
+  const auto ip = wire::str(info.get(), "ip");
+  const auto serverName = wire::str(info.get(), "server_name");
+  const auto port = wire::number(info.get(), "port");
+  if (ip.empty() || serverName.empty() || port <= 0 || port >= 65536)
+    return {};
+  auto grpc = wire::object();
+  wire::put(grpc.get(), "platform", int64_t(5));
+  wire::put(grpc.get(), "server_name", serverName);
+  wire::put(grpc.get(), "device_name", model ? model : "LINUX");
+  auto available = wire::object();
+  auto *lan = json_object_new_array();
+  auto endpoint = wire::object();
+  wire::put(endpoint.get(), "ip", ip);
+  wire::put(endpoint.get(), "port", port);
+  json_object_array_add(lan, endpoint.release());
+  json_object_object_add(available.get(), "lan", lan);
+  json_object_object_add(grpc.get(), "available_nets", available.release());
+  auto serialized = wire::dump(grpc.get());
+  return {serialized.begin(), serialized.end()};
+}
+static std::string p2p_public_cer_from_file(const char *path) {
+  if (!path || !*path)
+    return {};
+  std::ifstream stream(path);
+  std::string json((std::istreambuf_iterator<char>(stream)), {});
+  auto info = wire::parse(json);
+  return wire::str(info.get(), "ca_cert");
+}
 static std::string base64_encode(std::string_view input) {
   static constexpr char alphabet[] =
       "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -186,8 +259,9 @@ static bool protobuf_read_varint(const std::vector<unsigned char> &input,
   }
   return false;
 }
-static std::string protobuf_string_field(const std::vector<unsigned char> &input,
-                                         unsigned wanted) {
+static std::string
+protobuf_string_field(const std::vector<unsigned char> &input,
+                      unsigned wanted) {
   size_t offset = 0;
   while (offset < input.size()) {
     uint64_t tag = 0, value = 0;
@@ -202,8 +276,8 @@ static std::string protobuf_string_field(const std::vector<unsigned char> &input
           value > input.size() - offset)
         break;
       if ((tag >> 3) == wanted)
-        return std::string(reinterpret_cast<const char *>(input.data() + offset),
-                           value);
+        return std::string(
+            reinterpret_cast<const char *>(input.data() + offset), value);
       offset += value;
     } else {
       break;
@@ -391,14 +465,13 @@ static void business_service() {
                         {},
                         identity.unique_id.c_str()};
   using Initialize = void (*)(
-      BusinessConfig *, void *,
-      void (*)(void *, int, bool, unsigned long long), void (*)(void *, int),
-      void (*)(int, const char *, uint32_t), void (*)(bool), void (*)(void *),
-      void (*)());
+      BusinessConfig *, void *, void (*)(void *, int, bool, unsigned long long),
+      void (*)(void *, int), void (*)(int, const char *, uint32_t),
+      void (*)(bool), void (*)(void *), void (*)());
   ((Initialize)syms.at("_business_initialize"))(
       &config, nullptr, business_init_callback, business_status_callback,
-      business_push_callback, business_network_callback,
-      business_user_callback, business_flush_callback);
+      business_push_callback, business_network_callback, business_user_callback,
+      business_flush_callback);
   unsigned waits = getenv("WETYPE_NETWORK_LIVE") ? 120 : 3;
   while (waits-- && !business_init_callback_count)
     usleep(100000);
@@ -431,7 +504,12 @@ static void business_service() {
     operation_subcommand = 1001;
   else if (getenv("WETYPE_P2P_PEER"))
     operation_subcommand = 1002;
-  if (operation_subcommand && business_init_error == 0 && business_init_has_uin) {
+  else if (getenv("WETYPE_P2P_INIT_UIN"))
+    operation_subcommand = 1003;
+  else if (getenv("WETYPE_P2P_UPDATE"))
+    operation_subcommand = 1004;
+  if (operation_subcommand && business_init_error == 0 &&
+      business_init_has_uin) {
     char uin_text[32]{};
     snprintf(uin_text, sizeof(uin_text), "%llu", business_init_uin.load());
     if (!starting_uin) {
@@ -449,7 +527,8 @@ static void business_service() {
     uint32_t command_id = 4814;
     uint32_t wire_subcommand = operation_subcommand;
     if (operation_subcommand != 1000 && operation_subcommand != 1001 &&
-        operation_subcommand != 1002) {
+        operation_subcommand != 1002 && operation_subcommand != 1003 &&
+        operation_subcommand != 1004) {
       protobuf_uint(request, 1, business_init_uin.load());
       protobuf_uint(request, 2, 5);
     }
@@ -459,10 +538,9 @@ static void business_service() {
       protobuf_uint(device, 2, 5);
       protobuf_string(device, 4, "2.2.3(657)");
       protobuf_uint(device, 5, 1);
-      protobuf_string(
-          request, 3,
-          std::string(reinterpret_cast<const char *>(device.data()),
-                      device.size()));
+      protobuf_string(request, 3,
+                      std::string(reinterpret_cast<const char *>(device.data()),
+                                  device.size()));
     } else if (operation_subcommand == 40) {
       protobuf_string(request, 3, getenv("WETYPE_PAIRING_STATUS_CODE"));
     } else if (operation_subcommand == 32) {
@@ -470,8 +548,8 @@ static void business_service() {
     } else if (operation_subcommand == 34) {
       protobuf_uint(request, 3, 31); // devices, clipboard, hotwords and dict
     } else if (operation_subcommand == 35) {
-      protobuf_uint(request, 3, strtoull(getenv("WETYPE_UNBIND_UIN"), nullptr,
-                                         10));
+      protobuf_uint(request, 3,
+                    strtoull(getenv("WETYPE_UNBIND_UIN"), nullptr, 10));
     } else if (operation_subcommand == 39) {
       protobuf_uint(request, 3,
                     strtoull(getenv("WETYPE_GROUP_ID"), nullptr, 10));
@@ -566,10 +644,9 @@ static void business_service() {
         const size_t size = std::min<size_t>(3000, audio.size() - offset);
         std::vector<unsigned char> inner, outer;
         protobuf_string(inner, 2, voice_id);
-        protobuf_uint(inner, 3, 0);  // normal dictation scene
-        protobuf_string(inner, 4,
-                        audio.substr(offset, size));
-        protobuf_uint(inner, 5, 5);  // OPUS
+        protobuf_uint(inner, 3, 0); // normal dictation scene
+        protobuf_string(inner, 4, audio.substr(offset, size));
+        protobuf_uint(inner, 5, 5); // OPUS
         protobuf_uint(inner, 6, offset + size == audio.size());
         protobuf_uint(inner, 7, sequence++);
         protobuf_uint(inner, 11, offset + size);
@@ -587,11 +664,23 @@ static void business_service() {
       command_id = 4547;
       wire_subcommand = 0;
     } else if (operation_subcommand == 1001) {
-      // WtP2PTransfer.GenP2PTransferCodeReq. Capabilities 0x2 and 0x4
-      // are the two desktop/mobile transfer transports advertised by the
-      // current Android implementation. Certificate/link info are populated
-      // later by the selected transport.
+      // wetype_file_transfer.proto, checked against the macOS 2.2.3 Objective-C
+      // metadata. link_net_info is JSON used for role selection; the scanning
+      // phone reports preferred_client=true and the QR host reports false.
+      auto link = p2p_link_info_from_file(getenv("WETYPE_P2P_INFO_FILE"),
+                                          identity.model.c_str());
+      auto publicCer =
+          p2p_public_cer_from_file(getenv("WETYPE_P2P_INFO_FILE"));
+      if (!publicCer.empty())
+        protobuf_string(request, 1, publicCer);
+      if (!link.empty())
+        protobuf_string(request, 2,
+                        std::string(reinterpret_cast<const char *>(link.data()),
+                                    link.size()));
       protobuf_string(request, 3, identity.model);
+      // The upstream desktop advertises capability 0x2 and, when folder
+      // transfer is enabled, 0x4. These are feature bits rather than link
+      // types; WXP2P availability is conveyed by dispatch_buf.
       protobuf_uint(request, 4, 6);
       command_id = 4814;
       wire_subcommand = 73;
@@ -599,6 +688,45 @@ static void business_service() {
       protobuf_string(request, 1, getenv("WETYPE_P2P_PEER"));
       command_id = 4814;
       wire_subcommand = 75;
+    } else if (operation_subcommand == 1003) {
+      auto link = p2p_link_info_from_file(getenv("WETYPE_P2P_INFO_FILE"),
+                                          identity.model.c_str());
+      auto publicCer =
+          p2p_public_cer_from_file(getenv("WETYPE_P2P_INFO_FILE"));
+      protobuf_uint(request, 1,
+                    strtoull(getenv("WETYPE_P2P_INIT_UIN"), nullptr, 10));
+      if (!publicCer.empty())
+        protobuf_string(request, 2, publicCer);
+      if (!link.empty())
+        protobuf_string(request, 3,
+                        std::string(reinterpret_cast<const char *>(link.data()),
+                                    link.size()));
+      protobuf_string(request, 4, identity.model);
+      protobuf_uint(request, 5, 6);
+      command_id = 4814;
+      wire_subcommand = 77;
+    } else if (operation_subcommand == 1004) {
+      auto link = p2p_link_info_from_file(getenv("WETYPE_P2P_INFO_FILE"),
+                                          identity.model.c_str());
+      auto grpc = p2p_grpc_info_from_file(getenv("WETYPE_P2P_INFO_FILE"),
+                                          identity.model.c_str());
+      auto publicCer =
+          p2p_public_cer_from_file(getenv("WETYPE_P2P_INFO_FILE"));
+      protobuf_string(request, 1, getenv("WETYPE_P2P_UPDATE"));
+      if (!publicCer.empty())
+        protobuf_string(request, 2, publicCer);
+      if (!link.empty())
+        protobuf_string(request, 3,
+                        std::string(reinterpret_cast<const char *>(link.data()),
+                                    link.size()));
+      if (!grpc.empty())
+        protobuf_string(request, 4,
+                        std::string(reinterpret_cast<const char *>(grpc.data()),
+                                    grpc.size()));
+      protobuf_uint(request, 6, 0);
+      protobuf_uint(request, 7, 6);
+      command_id = 4814;
+      wire_subcommand = 74;
     }
     struct TaskOption {
       uint32_t timeout_ms;
@@ -609,14 +737,18 @@ static void business_service() {
       bool need_network_extra_json;
       unsigned char trailing_pad[3];
     } option{operation_subcommand == 1000 ? 30000u : 5000u,
-             operation_subcommand == 1000 ? uint8_t(2) : uint8_t(3), false,
-             0, 0, false, {}};
+             operation_subcommand == 1000 ? uint8_t(2) : uint8_t(3),
+             false,
+             0,
+             0,
+             false,
+             {}};
     static_assert(sizeof(TaskOption) == 16);
-    using StartTask = int (*)(
-        uint32_t, uint32_t, const char *, uint32_t, void *,
-        void (*)(void *, int, int, const char *, uint32_t, const char *,
-                 uint32_t, const char *, uint32_t),
-        const TaskOption *);
+    using StartTask =
+        int (*)(uint32_t, uint32_t, const char *, uint32_t, void *,
+                void (*)(void *, int, int, const char *, uint32_t, const char *,
+                         uint32_t, const char *, uint32_t),
+                const TaskOption *);
     if (task_requests.empty())
       task_requests.push_back(request);
     if (operation_subcommand == 1000) {
@@ -640,40 +772,40 @@ static void business_service() {
       auto translated = protobuf_string_field(business_task_response, 1);
       collected_voice_text = protobuf_string_field(
           std::vector<unsigned char>(translated.begin(), translated.end()), 4);
-    } else for (const auto &task_request : task_requests) {
-      for (unsigned attempt = 0; attempt < 10; ++attempt) {
-        business_task_callback_count = 0;
-        business_task_error = -1;
-        pairing_task =
-            ((StartTask)syms.at("_business_net_start_task_with_option"))(
-                command_id, wire_subcommand,
-                reinterpret_cast<const char *>(task_request.data()),
-                task_request.size(), nullptr, business_task_callback, &option);
-        for (unsigned wait = 0; wait < 60 &&
-                                !business_task_callback_count.load(
-                                    std::memory_order_acquire);
-             ++wait)
-          usleep(100000);
-        if (business_task_error != 200007)
+    } else
+      for (const auto &task_request : task_requests) {
+        for (unsigned attempt = 0; attempt < 10; ++attempt) {
+          business_task_callback_count = 0;
+          business_task_error = -1;
+          pairing_task =
+              ((StartTask)syms.at("_business_net_start_task_with_option"))(
+                  command_id, wire_subcommand,
+                  reinterpret_cast<const char *>(task_request.data()),
+                  task_request.size(), nullptr, business_task_callback,
+                  &option);
+          for (unsigned wait = 0;
+               wait < 60 &&
+               !business_task_callback_count.load(std::memory_order_acquire);
+               ++wait)
+            usleep(100000);
+          if (business_task_error != 200007)
+            break;
+          usleep(300000);
+        }
+        if (operation_subcommand == 1000 && business_task_error == 0) {
+          auto translated = protobuf_string_field(business_task_response, 1);
+          auto text = protobuf_string_field(
+              std::vector<unsigned char>(translated.begin(), translated.end()),
+              4);
+          if (!text.empty())
+            collected_voice_text = std::move(text);
+        }
+        if (business_task_error != 0)
           break;
-        usleep(300000);
       }
-      if (operation_subcommand == 1000 && business_task_error == 0) {
-        auto translated = protobuf_string_field(business_task_response, 1);
-        auto text = protobuf_string_field(
-            std::vector<unsigned char>(translated.begin(), translated.end()),
-            4);
-        if (!text.empty())
-          collected_voice_text = std::move(text);
-      }
-      if (business_task_error != 0)
-        break;
-    }
   }
-  auto calls =
-      ((unsigned (*)())dlsym(RTLD_DEFAULT, "wcwss_bridge_calls"))();
-  auto sends =
-      ((unsigned (*)())dlsym(RTLD_DEFAULT, "wcwss_bridge_sends"))();
+  auto calls = ((unsigned (*)())dlsym(RTLD_DEFAULT, "wcwss_bridge_calls"))();
+  auto sends = ((unsigned (*)())dlsym(RTLD_DEFAULT, "wcwss_bridge_sends"))();
   auto receives =
       ((unsigned (*)())dlsym(RTLD_DEFAULT, "wcwss_bridge_receives"))();
   std::string response_match_code =
@@ -719,8 +851,7 @@ static void business_service() {
       response_func_switch = protobuf_uint_field(group, 5, 0);
       auto hotwords = protobuf_messages_field(group, 4);
       if (!hotwords.empty())
-        response_hotword_version =
-            protobuf_uint_field(hotwords.front(), 1, 0);
+        response_hotword_version = protobuf_uint_field(hotwords.front(), 1, 0);
       auto clips = protobuf_messages_field(group, 3);
       if (!clips.empty()) {
         response_clipboard_version = protobuf_uint_field(clips.front(), 1, 0);
@@ -732,11 +863,11 @@ static void business_service() {
       }
       for (auto &bound : protobuf_messages_field(group, 2)) {
         auto item = wire::object();
-        wire::put(item.get(), "uin",
-                  int64_t(protobuf_uint_field(bound, 1, 0)));
+        wire::put(item.get(), "uin", int64_t(protobuf_uint_field(bound, 1, 0)));
         auto infos = protobuf_messages_field(bound, 2);
         if (!infos.empty()) {
-          wire::put(item.get(), "name", protobuf_string_field(infos.front(), 1));
+          wire::put(item.get(), "name",
+                    protobuf_string_field(infos.front(), 1));
           wire::put(item.get(), "platform",
                     int64_t(protobuf_uint_field(infos.front(), 2, 0)));
           wire::put(item.get(), "bind_time",
@@ -763,8 +894,7 @@ static void business_service() {
   }
   std::string response_transfer_code, response_transfer_url,
       response_transfer_image;
-  uint64_t response_transfer_expiration = 0,
-           response_transfer_expire_at = 0;
+  uint64_t response_transfer_expiration = 0, response_transfer_expire_at = 0;
   if (operation_subcommand == 1001) {
     response_error_code =
         protobuf_uint_field(business_task_response, 1, UINT64_MAX);
@@ -775,10 +905,18 @@ static void business_service() {
         protobuf_uint_field(business_task_response, 4, 0);
     response_transfer_url = protobuf_string_field(business_task_response, 5);
     response_transfer_image = protobuf_string_field(business_task_response, 6);
+  } else if (operation_subcommand == 1003) {
+    response_error_code =
+        protobuf_uint_field(business_task_response, 1, UINT64_MAX);
+    response_transfer_code = protobuf_string_field(business_task_response, 2);
+    response_transfer_expire_at =
+        protobuf_uint_field(business_task_response, 3, 0);
+    response_transfer_expiration =
+        protobuf_uint_field(business_task_response, 4, 0);
   }
   auto response_peer = wire::object();
   std::string response_dispatch_buf, response_peer_dispatch_buf;
-  if (operation_subcommand == 1002) {
+  if (operation_subcommand == 1002 || operation_subcommand == 1004) {
     response_error_code =
         protobuf_uint_field(business_task_response, 1, UINT64_MAX);
     auto peerBytes = protobuf_string_field(business_task_response, 2);
@@ -789,8 +927,7 @@ static void business_service() {
               base64_encode(protobuf_string_field(peer, 2)));
     wire::put(response_peer.get(), "link_net_info",
               base64_encode(protobuf_string_field(peer, 3)));
-    wire::put(response_peer.get(), "public_ip",
-              protobuf_string_field(peer, 4));
+    wire::put(response_peer.get(), "public_ip", protobuf_string_field(peer, 4));
     wire::put(response_peer.get(), "ready",
               bool(protobuf_uint_field(peer, 5, 0)));
     wire::put(response_peer.get(), "grpc_net_info",
@@ -818,7 +955,8 @@ static void business_service() {
   wire::put(report.get(), "business_initialize_result", int64_t(0));
   wire::put(report.get(), "callback_count",
             int64_t(business_init_callback_count.load()));
-  wire::put(report.get(), "callback_error", int64_t(business_init_error.load()));
+  wire::put(report.get(), "callback_error",
+            int64_t(business_init_error.load()));
   wire::put(report.get(), "has_uin", bool(business_init_has_uin));
   wire::put(report.get(), "uin", int64_t(business_init_uin.load()));
   wire::put(report.get(), "device_code_bytes",
@@ -834,8 +972,7 @@ static void business_service() {
             int64_t(business_task_response.size()));
   wire::put(report.get(), "operation_subcommand",
             int64_t(operation_subcommand));
-  wire::put(report.get(), "response_error_code",
-            int64_t(response_error_code));
+  wire::put(report.get(), "response_error_code", int64_t(response_error_code));
   wire::put(report.get(), "match_code", response_match_code);
   wire::put(report.get(), "status", int64_t(response_status));
   wire::put(report.get(), "bind_id", response_bind_id);
@@ -844,13 +981,11 @@ static void business_service() {
   wire::put(report.get(), "func_switch", int64_t(response_func_switch));
   wire::put(report.get(), "clipboard_version",
             int64_t(response_clipboard_version));
-  wire::put(report.get(), "hotword_version",
-            int64_t(response_hotword_version));
+  wire::put(report.get(), "hotword_version", int64_t(response_hotword_version));
   wire::put(report.get(), "clipboard", response_clipboard);
-  wire::put(report.get(), "clipboard_type",
-            int64_t(response_clipboard_type));
+  wire::put(report.get(), "clipboard_type", int64_t(response_clipboard_type));
   wire::put(report.get(), "clipboard_binary",
-            response_clipboard_type == 5
+            !response_clipboard_binary.empty()
                 ? base64_encode(response_clipboard_binary)
                 : std::string());
   wire::put(report.get(), "voice_text", response_voice_text);

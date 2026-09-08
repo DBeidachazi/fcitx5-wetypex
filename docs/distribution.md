@@ -26,6 +26,12 @@ cd dist/arch
 makepkg -C -f --noconfirm
 ```
 
+## AUR
+
+每次正式发布后，发布工作流会使用仓库中的 `packaging/aur/PKGBUILD` 更新
+`fcitx5-wetypex` AUR 软件包及其 `.SRCINFO`。工作流支持只重试 AUR 发布，
+无需重复构建其他发行格式。
+
 发布前应在干净构建环境中运行依赖检查和完整构建。不要使用 `makepkg -d` 生成正式发布物。
 
 ## 版本一致性
@@ -35,7 +41,7 @@ makepkg -C -f --noconfirm
 - `CMakeLists.txt` 的 `project(... VERSION ...)`。
 - `packaging/PKGBUILD.in` 的 `pkgver`。
 - `tools/package_release.py` 的 `version`。
-- `CHANGELOG.md` 和 README 安装示例。
+- README 安装示例。
 
 ## 安装布局
 

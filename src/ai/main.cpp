@@ -267,11 +267,5 @@ int main(int argc, char **argv) {
   AiWindow window(argc >= 2 ? QString::fromLocal8Bit(argv[1]) : QString(),
                   argc >= 3 ? QString::fromLocal8Bit(argv[2]) : QString());
   window.show();
-  const QString screenshot = qEnvironmentVariable("WETYPE_AI_SCREENSHOT");
-  if (!screenshot.isEmpty())
-    QTimer::singleShot(3500, &window, [&app, &window, screenshot] {
-      window.grab().save(screenshot);
-      app.quit();
-    });
   return app.exec();
 }

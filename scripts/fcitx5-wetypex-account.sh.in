@@ -74,11 +74,34 @@ case "$command_name" in
   p2p-code)
     operation_name=WETYPE_P2P_CODE
     operation_value=1
+    p2p_info_source="${2:-}"
+    if [ -n "$p2p_info_source" ]; then
+      test -f "$p2p_info_source" || {
+        echo "p2p-code info file is not readable" >&2
+        exit 64
+      }
+    fi
     ;;
   p2p-peer)
     operation_name=WETYPE_P2P_PEER
     operation_value="${2:-}"
     test -n "$operation_value" || { echo "p2p-peer requires a transfer code" >&2; exit 64; }
+    ;;
+  p2p-init)
+    operation_name=WETYPE_P2P_INIT_UIN
+    operation_value="${2:-}"
+    p2p_info_source="${3:-}"
+    case "$operation_value" in *[!0-9]*|'') echo "p2p-init requires a device UIN" >&2; exit 64 ;; esac
+    if [ -n "$p2p_info_source" ]; then
+      test -f "$p2p_info_source" || { echo "p2p-init info file is not readable" >&2; exit 64; }
+    fi
+    ;;
+  p2p-update)
+    operation_name=WETYPE_P2P_UPDATE
+    operation_value="${2:-}"
+    p2p_info_source="${3:-}"
+    test -n "$operation_value" || { echo "p2p-update requires a transfer code" >&2; exit 64; }
+    test -f "$p2p_info_source" || { echo "p2p-update requires transfer info" >&2; exit 64; }
     ;;
   unbind)
     operation_name=WETYPE_UNBIND_UIN
@@ -86,7 +109,7 @@ case "$command_name" in
     case "$operation_value" in *[!0-9]*|'') echo "unbind requires a device UIN" >&2; exit 64 ;; esac
     ;;
   *)
-    echo "usage: fcitx5-wetypex-account pairing-code | pairing-status CODE | confirm-bind BIND_ID | group-info | set-functions GROUP_ID MASK | send-clipboard GROUP_ID TEXT | send-image GROUP_ID PNG_FILE | voice-file OPUS_FILE | p2p-code | p2p-peer CODE | unbind UIN" >&2
+    echo "usage: fcitx5-wetypex-account pairing-code | pairing-status CODE | confirm-bind BIND_ID | group-info | set-functions GROUP_ID MASK | send-clipboard GROUP_ID TEXT | send-image GROUP_ID PNG_FILE | voice-file OPUS_FILE | p2p-code [TRANSFER_INFO_JSON] | p2p-peer CODE | p2p-init UIN [TRANSFER_INFO_JSON] | unbind UIN" >&2
     exit 64
     ;;
 esac
@@ -109,6 +132,10 @@ if [ "$command_name" = voice-file ]; then
   cp "$voice_source" "$state/business/voice-input.opus"
   chmod 600 "$state/business/voice-input.opus"
   trap 'rm -f "$state/business/voice-input.opus"' EXIT
+fi
+if { [ "$command_name" = p2p-code ] || [ "$command_name" = p2p-init ] || [ "$command_name" = p2p-update ]; } && [ -n "${p2p_info_source:-}" ]; then
+  cp "$p2p_info_source" "$state/business/p2p-info.json"
+  chmod 600 "$state/business/p2p-info.json"
 fi
 model="$(cat /sys/class/dmi/id/product_name 2>/dev/null || true)"
 test -n "$model" || model=LINUX
@@ -137,6 +164,7 @@ run_original() {
       --setenv WETYPE_NETWORK_LIVE 1 \
       --setenv WETYPE_GROUP_ID "${group_id:-0}" \
       --setenv WETYPE_VOICE_POLISH "${WETYPE_VOICE_POLISH:-1}" \
+      --setenv WETYPE_P2P_INFO_FILE /work/business/p2p-info.json \
       --setenv "$operation_name" "$operation_value" \
       /support/wetypex-engine-host /input business-service 2>"$log"
 }
@@ -183,6 +211,7 @@ elif command == "group-info":
     service_error = data.get("response_error_code", -1)
     result = {"ok": transport_error == 0 and service_error == 0,
               "group_id": data.get("group_id", 0),
+              "self_uin": data.get("uin", 0),
               "func_switch": data.get("func_switch", 0),
               "devices": data.get("devices", []),
               "clipboard": data.get("clipboard", ""),
@@ -203,7 +232,7 @@ elif command == "voice-file":
               "payload": data.get("voice_payload", ""),
               "error": transport_error,
               "response_bytes": data.get("pairing_response_bytes", 0)}
-elif command == "p2p-code":
+elif command in ("p2p-code", "p2p-init"):
     service_error = data.get("response_error_code", -1)
     code = data.get("transfer_code", "")
     result = {"ok": transport_error == 0 and service_error == 0 and bool(code),
@@ -213,7 +242,7 @@ elif command == "p2p-code":
               "expire_at": data.get("transfer_expire_at", 0),
               "expiration": data.get("transfer_expiration", 0),
               "error": transport_error, "service_error": service_error}
-elif command == "p2p-peer":
+elif command in ("p2p-peer", "p2p-update"):
     service_error = data.get("response_error_code", -1)
     result = {"ok": transport_error == 0 and service_error == 0,
               "peer": data.get("peer", {}),

@@ -7,6 +7,14 @@ output="$project_root/dist"
 stage="$output/root"
 
 mkdir -p "$output"
+find "$output" "$output/arch" "$output/debian" "$output/fedora" \
+    -maxdepth 1 -type f \
+    \( -name 'fcitx5-wetypex-*.tar.gz' -o \
+       -name 'fcitx5-wetypex-*.tar.zst' -o \
+       -name 'fcitx5-wetypex-*.rpm' -o \
+       -name 'fcitx5-wetypex_*.deb' -o \
+       -name 'fcitx5-wetypex-*.pkg.tar.zst' \) \
+    -delete 2>/dev/null || true
 rm -rf "$stage"
 mkdir -p "$stage"
 "$project_root/packaging/stage.sh" "$stage"

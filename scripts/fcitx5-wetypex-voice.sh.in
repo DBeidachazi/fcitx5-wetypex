@@ -17,7 +17,16 @@ case "${1:-}" in
       if kill -0 "$old_pid" 2>/dev/null; then exit 0; fi
     fi
     rm -f "$wav" "$opus"
-    pw-record --rate 16000 --channels 1 --format s16 "$wav" >"$log" 2>&1 &
+    config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
+    microphone=自动检测
+    if [ -f "$config_home/fcitx5/wetypex.json" ]; then
+      microphone="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("voice_microphone","自动检测"))' "$config_home/fcitx5/wetypex.json" 2>/dev/null || printf 自动检测)"
+    fi
+    if [ "$microphone" = 自动检测 ] || [ -z "$microphone" ]; then
+      pw-record --rate 16000 --channels 1 --format s16 "$wav" >"$log" 2>&1 &
+    else
+      pw-record --target "$microphone" --rate 16000 --channels 1 --format s16 "$wav" >"$log" 2>&1 &
+    fi
     recorder=$!
     printf '%s\n' "$recorder" > "$control"
     chmod 600 "$control" "$log"
@@ -43,6 +52,8 @@ case "${1:-}" in
     if [ -f "$config_home/fcitx5/wetypex.json" ]; then
       WETYPE_VOICE_POLISH="$(python3 -c 'import json,sys;print(1 if json.load(open(sys.argv[1])).get("voice_smart_polish",True) else 0)' "$config_home/fcitx5/wetypex.json" 2>/dev/null || printf 1)"
       export WETYPE_VOICE_POLISH
+      WETYPE_VOICE_PUNCTUATION="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("voice_punctuation","智能标点"))' "$config_home/fcitx5/wetypex.json" 2>/dev/null || printf 智能标点)"
+      export WETYPE_VOICE_PUNCTUATION
     fi
     output=
     attempt=0
@@ -63,6 +74,19 @@ data = json.load(open(sys.argv[2]))
 text = data.get("text", "") if data.get("ok") else ""
 if not text:
     raise SystemExit(1)
+mode = os.environ.get("WETYPE_VOICE_PUNCTUATION", "智能标点")
+# Windows/macOS applyPunctuationMode dispatches modes 0..3 as smart, full,
+# no-terminal-period and punctuation-to-spaces.  The recovered initial smart
+# state is 0:0:1: on final results it keeps question marks but removes a final
+# Chinese/ASCII period.  The adaptive desktop learner may later flip these
+# three dimensions after observing edits; Linux starts from the same state.
+if mode in ("智能标点", "句末不加句号"):
+    text = text.rstrip()
+    if text.endswith(("。", ".")):
+        text = text[:-1]
+elif mode == "空格替换标点":
+    import re
+    text = re.sub(r"[，。！？；：、,.!?;:]+", " ", text)
 path = pathlib.Path(sys.argv[1])
 tmp = path.with_suffix(".tmp")
 tmp.write_text(json.dumps({"version": time.time_ns(), "text": text}, ensure_ascii=False) + "\n")

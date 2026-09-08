@@ -41,8 +41,8 @@
 | 个人词库与常用语 | 本地持久化；设备组同步器已接入 |
 | 语音输入 | PipeWire 录音、Opus 编码、原版在线识别与回填 |
 | 问 AI | `=` 上下文触发、真实在线回答和独立问答窗口 |
-| 隔空传送 | 官方传输码、二维码和对端轮询；文件字节通道尚未完成 |
-| V 模式 | 尚未完成 |
+| 隔空传送 | 官方传输码与二维码、原版 Flurry LAN 与 WXP2P 直连/中继通道 |
+| V 模式 | 原版计算候选，以及计算、剪贴板、常用语和符号快捷栏 |
 
 目前仅在 Arch Linux、KDE Plasma 和 Wayland 上进行过测试。各项能力的支持范围见[功能状态](docs/feature-status.md)。
 
@@ -57,7 +57,7 @@ WeTypeX 安装程序从官方包中提取输入核心与词典，生成固定地
 WeTypeX 插件 ────────── 候选、预编辑、快捷键、剪贴板
    │ 私有管道
    ▼
-受限引擎宿主 ───────── 原版输入核心与词典
+受限引擎宿主 ───────── 原版输入核心、词典与 Flurry/WXP2P 文件通道
    │                    │
    │ Linux ABI 适配      └─ 用户词库 / 常用语
    ▼
@@ -73,15 +73,23 @@ WeTypeX 插件 ────────── 候选、预编辑、快捷键、�
 从 [GitHub Releases](https://github.com/panxuc/fcitx5-wetypex/releases/latest) 下载软件包：
 
 ```bash
-sudo pacman -U ./fcitx5-wetypex-0.1.0-1-x86_64.pkg.tar.zst
+sudo pacman -U ./fcitx5-wetypex-2.2.3.657-1-x86_64.pkg.tar.zst
 ```
 
-发布包依赖 Fcitx5、LibIME、Qt 6、Bubblewrap、PipeWire、FFmpeg、libc++、curl 和 json-c。Pacman 会从已配置的软件仓库解析依赖。
+也可以从 AUR 安装：
+
+```bash
+paru -S fcitx5-wetypex
+```
+
+安装完成后，Pacman 会在终端中打印首次设置步骤。
+
+发布包依赖 Fcitx5、LibIME、Qt 6、Bubblewrap、PipeWire、FFmpeg、libc++、curl、json-c、libnotify 和 Polkit。Pacman 会从已配置的软件仓库解析依赖。
 
 ### Debian 与 Ubuntu
 
 ```bash
-sudo apt install ./fcitx5-wetypex_0.1.0_amd64.deb
+sudo apt install ./fcitx5-wetypex_2.2.3.657_amd64.deb
 ```
 
 Debian 软件包面向提供 Fcitx5 5.1、LibIME 和 Qt 6 WebEngine 的发行版；较早版本需要使用相应 backports 或升级系统组件。
@@ -89,7 +97,7 @@ Debian 软件包面向提供 Fcitx5 5.1、LibIME 和 Qt 6 WebEngine 的发行版
 ### Fedora 与兼容的 RPM 发行版
 
 ```bash
-sudo dnf install ./fcitx5-wetypex-0.1.0-1.x86_64.rpm
+sudo dnf install ./fcitx5-wetypex-2.2.3.657-1.x86_64.rpm
 ```
 
 FFmpeg 及部分桌面依赖可能来自发行版启用的附加软件仓库。
@@ -97,7 +105,7 @@ FFmpeg 及部分桌面依赖可能来自发行版启用的附加软件仓库。
 ### 便携归档
 
 ```bash
-sudo tar --zstd -C / -xf ./fcitx5-wetypex-0.1.0-linux-x86_64.tar.zst
+sudo tar --zstd -C / -xf ./fcitx5-wetypex-2.2.3.657-linux-x86_64.tar.zst
 ```
 
 便携归档不经过软件包管理器解析依赖，更适合已经准备好运行环境的系统。
@@ -162,7 +170,7 @@ fcitx5-wetypex-account pairing-code # 生成新的六位匹配码
 - `Ctrl + Win + Shift`：启动语音输入，再按任意键结束。
 - `Ctrl + Win`：按住说话，松开结束。
 
-所有快捷键、输入方式、候选数量、主题、模糊音和同步开关也会出现在 Fcitx5 自带的输入法配置页中。配置项说明见[配置参考](docs/configuration.md)。
+所有快捷键、输入方式、候选数量、主题、模糊音和同步开关也会出现在 Fcitx5 自带的输入法配置页中；同一页面提供完整设置、账号与同步入口，采用与 Fcitx5 拼音词典管理器相同的 `ExternalOption` 扩展机制。配置项说明见[配置参考](docs/configuration.md)。
 
 ## 数据目录
 
@@ -202,7 +210,6 @@ fcitx5-diagnose | less
 - [配置参考](docs/configuration.md)
 - [故障排查](docs/troubleshooting.md)
 - [发行与打包](docs/distribution.md)
-- [变更记录](CHANGELOG.md)
 
 ## 参与开发
 

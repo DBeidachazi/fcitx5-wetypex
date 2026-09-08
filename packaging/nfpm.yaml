@@ -23,6 +23,7 @@ overrides:
       - libcurl4
       - libjson-c5
       - fcitx5
+      - libfcitx5-qt6-1
       - libimecore0
       - libimepinyin0
       - libqt6widgets6
@@ -36,6 +37,8 @@ overrides:
       - pipewire-bin
       - ffmpeg
       - wl-clipboard
+      - libnotify-bin
+      - policykit-1
   rpm:
     depends:
       - glibc
@@ -43,6 +46,7 @@ overrides:
       - libcurl
       - json-c
       - fcitx5
+      - fcitx5-qt-libfcitx5qt6widgets
       - libime
       - qt6-qtbase
       - qt6-qtsvg
@@ -53,3 +57,5 @@ overrides:
       - pipewire-utils
       - ffmpeg
       - wl-clipboard
+      - libnotify
+      - polkit

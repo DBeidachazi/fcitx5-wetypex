@@ -1,6 +1,6 @@
 // Native engine IPC. All engine operations are serialized on the service
 // thread.
-#include "control.inc"
+#include "control.hpp"
 // Verified against +[WXIMEUtil addHotWord:value:] and removeHotWord:.
 // The 80-byte aggregate is passed BY VALUE, including in the enumerator
 // callback.
@@ -74,7 +74,7 @@ static void configure_cloud_session(unsigned char *config) {
   // SessionConfigRW fallback object and its field serializer.  In particular,
   // the desktop enables cloud candidates while typing, but keeps the mobile-
   // style post-commit "most likely" list disabled.
-  config[0x41] = 1; // cloud.enable_cloud_search_by_input
+  config[0x41] = 1;                 // cloud.enable_cloud_search_by_input
   *(uint32_t *)(config + 0x50) = 3; // cloud.process_input.return_cnt
   *(uint32_t *)(config + 0x54) = 1; // cloud.process_input.predict_next_n
 }
@@ -83,8 +83,8 @@ static void read_service_candidates(void *iterator,
   output.clear();
   for (unsigned rank = 0; iterator && rank < 50; rank++) {
     alignas(16) unsigned char c[512]{};
-    if (!((bool (*)(void *, void *))syms.at("_wxime_candidate_next"))(
-            iterator, c))
+    if (!((bool (*)(void *, void *))syms.at("_wxime_candidate_next"))(iterator,
+                                                                      c))
       break;
     const char *text;
     const unsigned char *id;
@@ -314,6 +314,10 @@ static void service_loop() {
         uint32_t wubiSolution = std::clamp<int>(
             wire::number(request.get(), "wubi_solution", 0), 0, 2);
         memcpy(config + 0x24, &wubiSolution, sizeof(wubiSolution));
+        config[0x28] = wire::number(request.get(), "wubi_pinyin", 0);
+        config[0x29] = wire::number(request.get(), "wubi_unique_commit", 0);
+        config[0x2a] = wire::number(request.get(), "wubi_next_commit", 0);
+        config[0xaf] = wire::number(request.get(), "wubi_wildcard_comment", 0);
         if (wire::number(request.get(), "smart_input", 1)) {
           // InputAugmenter: transpose, neighbouring-key, insertion and skip
           // correction. Offsets are recovered from the original JNI bridge.
@@ -340,11 +344,11 @@ static void service_loop() {
         config[0x1e] = wire::number(request.get(), "fuzzy_an_ai", 0);
         config[0x1f] = wire::number(request.get(), "fuzzy_eng_ong", 0);
         if (wire::number(request.get(), "emoji_recommend", 1)) {
-          config[0x33] = 1; // WeChat emoji
-          config[0x34] = 1; // normal emoji
-          config[0x35] = 1; // kaomoji
-          config[0x36] = 1; // emoji plus
-          config[0x39] = 1; // symbol emoji
+          config[0x33] = wire::number(request.get(), "wechat_emoji", 1);
+          config[0x34] = wire::number(request.get(), "normal_emoji", 1);
+          config[0x35] = wire::number(request.get(), "kaomoji", 1);
+          config[0x36] = wire::number(request.get(), "large_emoji", 1);
+          config[0x39] = wire::number(request.get(), "symbol_emoji", 1);
         }
         // SessionCreator gates construction of VModeV2 on config +0x125.
         // The UI later activates that wrapper with session bool option 0x11.
@@ -411,7 +415,7 @@ static void service_loop() {
       } else if (op == "punctuation") {
         static const std::map<std::string, std::string> map = {
             {",", "，"}, {".", "。"}, {";", "；"}, {":", "："},
-            {"?", "？"}, {"!", "！"}, {"'", "'"}, {"/", "、"}};
+            {"?", "？"}, {"!", "！"}, {"'", "'"},  {"/", "、"}};
         auto key = wire::str(request.get(), "key");
         auto it = map.find(key);
         if (key.size() != 1 || (unsigned char)key[0] < 0x20 ||

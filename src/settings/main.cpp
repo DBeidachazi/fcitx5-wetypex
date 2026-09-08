@@ -5,25 +5,36 @@
 #include <QCheckBox>
 #include <QComboBox>
 #include <QDBusInterface>
+#include <QDateTime>
+#include <QDesktopServices>
+#include <QDialog>
 #include <QDir>
+#include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
-#include <QJsonDocument>
 #include <QJsonArray>
+#include <QJsonDocument>
 #include <QJsonObject>
+#include <QLineEdit>
 #include <QListWidget>
+#include <QLocalSocket>
+#include <QMessageBox>
 #include <QMovie>
+#include <QPlainTextEdit>
 #include <QProcess>
 #include <QPushButton>
 #include <QRadioButton>
 #include <QRegularExpression>
 #include <QSaveFile>
+#include <QScrollArea>
 #include <QSignalBlocker>
 #include <QSlider>
 #include <QStackedWidget>
 #include <QTimer>
-#include <tuple>
+#include <QUrl>
+#include <algorithm>
 #include <functional>
+#include <tuple>
 
 using namespace original_ui;
 
@@ -54,8 +65,8 @@ static void runAccount(QWidget *owner, const QStringList &arguments,
   QObject::connect(
       process, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), owner,
       [process, done = std::move(done)](int code, QProcess::ExitStatus) {
-        auto result = QJsonDocument::fromJson(process->readAllStandardOutput())
-                          .object();
+        auto result =
+            QJsonDocument::fromJson(process->readAllStandardOutput()).object();
         done(code, result);
         process->deleteLater();
       });
@@ -77,6 +88,154 @@ static bool writeSetting(const QString &key, const QJsonValue &value) {
                             "org.fcitx.Fcitx.Controller1");
   controller.asyncCall("ReloadAddonConfig", "wetypex");
   return true;
+}
+static QJsonObject engineControl(const QJsonObject &request,
+                                 QString *error = nullptr) {
+  QLocalSocket socket;
+  socket.connectToServer(
+      QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation) +
+      "/fcitx5-wetypex/state/control.sock");
+  if (!socket.waitForConnected(1500)) {
+    // The official settings app can edit common phrases even before its input
+    // service is active. Use the same engine protocol in a short-lived process
+    // when the resident Fcitx addon has no control socket yet.
+    QProcess backend;
+    backend.setProgram(qEnvironmentVariable("WETYPE_BACKEND_LAUNCHER",
+                                            QStringLiteral(WETYPE_BACKEND)));
+    backend.start();
+    if (!backend.waitForStarted(3000)) {
+      if (error)
+        *error = "输入核心无法启动";
+      return {};
+    }
+    QElapsedTimer deadline;
+    deadline.start();
+    QByteArray pending;
+    bool ready = false;
+    while (deadline.elapsed() < 180000 &&
+           backend.state() != QProcess::NotRunning) {
+      if (!backend.waitForReadyRead(
+              qMin(1000, 180000 - int(deadline.elapsed()))))
+        continue;
+      pending += backend.readAllStandardOutput();
+      qsizetype newline = -1;
+      while ((newline = pending.indexOf('\n')) >= 0) {
+        const auto line = pending.left(newline);
+        pending.remove(0, newline + 1);
+        if (QJsonDocument::fromJson(line).object().value("event") == "ready") {
+          ready = true;
+          break;
+        }
+      }
+      if (ready)
+        break;
+    }
+    if (!ready) {
+      backend.kill();
+      backend.waitForFinished();
+      if (error)
+        *error = "输入核心初始化失败";
+      return {};
+    }
+    backend.write(QJsonDocument(request).toJson(QJsonDocument::Compact) + '\n');
+    backend.waitForBytesWritten(3000);
+    QJsonObject object;
+    deadline.restart();
+    while (deadline.elapsed() < 10000 &&
+           backend.state() != QProcess::NotRunning) {
+      if (!backend.waitForReadyRead(qMin(500, 10000 - int(deadline.elapsed()))))
+        continue;
+      pending += backend.readAllStandardOutput();
+      const auto newline = pending.indexOf('\n');
+      if (newline < 0)
+        continue;
+      object = QJsonDocument::fromJson(pending.left(newline)).object();
+      break;
+    }
+    backend.write("{\"op\":\"quit\",\"session\":1,\"seq\":0}\n");
+    backend.waitForFinished(3000);
+    if (backend.state() != QProcess::NotRunning) {
+      backend.kill();
+      backend.waitForFinished();
+    }
+    if (object.isEmpty() && error)
+      *error = "输入核心没有响应";
+    else if (object.contains("error") && error)
+      *error = object.value("error").toString();
+    return object;
+  }
+  socket.write(QJsonDocument(request).toJson(QJsonDocument::Compact) + '\n');
+  if (!socket.waitForBytesWritten(1500) || !socket.waitForReadyRead(3000)) {
+    if (error)
+      *error = "输入核心没有响应";
+    return {};
+  }
+  QByteArray response;
+  while (!response.contains('\n') && socket.waitForReadyRead(200))
+    response += socket.readAll();
+  response += socket.readAll();
+  const auto object = QJsonDocument::fromJson(response.trimmed()).object();
+  if (object.contains("error") && error)
+    *error = object.value("error").toString();
+  return object;
+}
+
+static QJsonObject hotwordRequest(const QString &operation,
+                                  const QJsonObject &fields = {},
+                                  QString *error = nullptr) {
+  QJsonObject request = fields;
+  request["session"] = 1;
+  request["seq"] = QDateTime::currentMSecsSinceEpoch();
+  request["epoch"] = 1;
+  request["op"] = operation;
+  return engineControl(request, error);
+}
+
+static bool editHotword(QWidget *owner, const QJsonObject &existing = {}) {
+  QDialog dialog(owner, Qt::Dialog | Qt::FramelessWindowHint);
+  dialog.setModal(true);
+  dialog.setObjectName("windowSurface");
+  dialog.setFixedSize(430, 285);
+  auto *layout = new QVBoxLayout(&dialog);
+  layout->setContentsMargins(22, 16, 22, 20);
+  auto *title = new QLabel(existing.isEmpty() ? "添加常用语" : "编辑常用语");
+  title->setObjectName("pageHeading");
+  title->setAlignment(Qt::AlignCenter);
+  layout->addWidget(title);
+  layout->addWidget(new QLabel("常用语内容"));
+  auto *words = new QPlainTextEdit(existing.value("words").toString());
+  words->setFixedHeight(92);
+  layout->addWidget(words);
+  layout->addWidget(new QLabel("输入码（汉字、拼音或首字母）"));
+  auto *key = new QLineEdit(existing.value("key").toString());
+  layout->addWidget(key);
+  auto *buttons = new QHBoxLayout;
+  buttons->addStretch();
+  auto *cancel = new QPushButton("取消"), *save = greenButton("保存");
+  buttons->addWidget(cancel);
+  buttons->addWidget(save);
+  layout->addLayout(buttons);
+  QObject::connect(cancel, &QPushButton::clicked, &dialog, &QDialog::reject);
+  QObject::connect(save, &QPushButton::clicked, [&] {
+    const auto text = words->toPlainText().trimmed();
+    const auto shortcut = key->text().trimmed();
+    if (text.isEmpty() || shortcut.isEmpty()) {
+      QMessageBox::warning(&dialog, "常用语", "内容和输入码不能为空");
+      return;
+    }
+    QString error;
+    QJsonObject fields{{"id", existing.value("id").toString(QString::number(
+                                  QDateTime::currentMSecsSinceEpoch()))},
+                       {"key", shortcut},
+                       {"words", text}};
+    hotwordRequest("hotword_set", fields, &error);
+    if (!error.isEmpty()) {
+      QMessageBox::warning(&dialog, "常用语", error);
+      return;
+    }
+    dialog.accept();
+  });
+  return dialog.exec() == QDialog::Accepted;
 }
 static QMap<QString, QString> readAppearance() {
   QMap<QString, QString> result;
@@ -127,8 +286,9 @@ static QLabel *iconLabel(const QString &name, int size = 20) {
 static QLabel *imageIconLabel(const QString &name, int size = 20) {
   auto *label = new QLabel;
   label->setFixedSize(size, size);
-  label->setPixmap(QPixmap(imageAsset(name)).scaled(
-      size, size, Qt::KeepAspectRatio, Qt::SmoothTransformation));
+  label->setPixmap(
+      QPixmap(imageAsset(name))
+          .scaled(size, size, Qt::KeepAspectRatio, Qt::SmoothTransformation));
   label->setAlignment(Qt::AlignCenter);
   label->setStyleSheet("background:transparent;");
   return label;
@@ -192,13 +352,14 @@ class PairingOverlay final : public QWidget {
   void start(const QStringList &arguments) {
     if (process_.state() != QProcess::NotRunning)
       return;
-    process_.setProgram(qEnvironmentVariable("WETYPE_ACCOUNT_TOOL",
-                                             WETYPE_ACCOUNT_TOOL));
+    process_.setProgram(
+        qEnvironmentVariable("WETYPE_ACCOUNT_TOOL", WETYPE_ACCOUNT_TOOL));
     process_.setArguments(arguments);
     process_.start();
   }
   void finish(int exitCode) {
-    const auto document = QJsonDocument::fromJson(process_.readAllStandardOutput());
+    const auto document =
+        QJsonDocument::fromJson(process_.readAllStandardOutput());
     const auto result = document.object();
     if (exitCode || !result.value("ok").toBool()) {
       if (stage_ == Stage::Status && !code_.isEmpty()) {
@@ -274,8 +435,7 @@ public:
         "QLabel#pairingDigit{font-size:32px;color:#23c891;background:#fafafa;"
         "border-radius:8px;}"
         "QLabel#pairingMessage{font-size:14px;color:#aaa;}");
-    auto *close =
-        new SourceIconButton(asset("icon_windows_close_btn"), dialog);
+    auto *close = new SourceIconButton(asset("icon_windows_close_btn"), dialog);
     close->setGeometry(384, 0, 46, 28);
     QObject::connect(close, &QAbstractButton::clicked, this,
                      &QWidget::deleteLater);
@@ -293,20 +453,18 @@ public:
       digits_[i]->setAlignment(Qt::AlignCenter);
       digits_[i]->setGeometry(47 + i * 56, 112, 48, 65);
     }
-    message_ = new QLabel(
-        "请在你的另一台设备中进入「手机端微信输入法设置 → 跨设备\n"
-        "→ 粘贴传送 → 关联设备」输入上方匹配码关联",
-        dialog);
+    message_ =
+        new QLabel("请在你的另一台设备中进入「手机端微信输入法设置 → 跨设备\n"
+                   "→ 粘贴传送 → 关联设备」输入上方匹配码关联",
+                   dialog);
     message_->setObjectName("pairingMessage");
     message_->setAlignment(Qt::AlignCenter);
     message_->setGeometry(36, 205, 348, 48);
     close->raise();
     close->show();
-    QObject::connect(&process_,
-                     qOverload<int, QProcess::ExitStatus>(&QProcess::finished),
-                     this, [this](int code, QProcess::ExitStatus) {
-                       finish(code);
-                     });
+    QObject::connect(
+        &process_, qOverload<int, QProcess::ExitStatus>(&QProcess::finished),
+        this, [this](int code, QProcess::ExitStatus) { finish(code); });
     QObject::connect(&poll_, &QTimer::timeout, this, [this] {
       poll_.stop();
       stage_ = Stage::Status;
@@ -409,6 +567,81 @@ static void applyClassicTheme(int mode, int size, QLabel *status) {
                       : "外观已应用");
 }
 
+using ToggleSpec = std::tuple<QString, QString, bool>;
+static void runToggleDialog(QWidget *owner, const QString &title,
+                            const QList<ToggleSpec> &options) {
+  QDialog dialog(owner, Qt::Dialog | Qt::FramelessWindowHint);
+  dialog.setModal(true);
+  dialog.setObjectName("windowSurface");
+  dialog.setFixedSize(
+      430, std::min(540, 86 + static_cast<int>(options.size()) * 48));
+  auto *layout = new QVBoxLayout(&dialog);
+  layout->setContentsMargins(20, 12, 20, 20);
+  auto *heading = new QWidget;
+  heading->setFixedHeight(38);
+  auto *headingLayout = new QHBoxLayout(heading);
+  headingLayout->setContentsMargins(0, 0, 0, 0);
+  headingLayout->addStretch();
+  auto *label = new QLabel(title);
+  label->setObjectName("pageHeading");
+  headingLayout->addWidget(label);
+  headingLayout->addStretch();
+  auto *close = new SourceIconButton(asset("icon_windows_close_btn"));
+  close->setFixedSize(26, 26);
+  headingLayout->addWidget(close);
+  QObject::connect(close, &QAbstractButton::clicked, &dialog, &QDialog::accept);
+  layout->addWidget(heading);
+  auto *scroll = new QScrollArea;
+  scroll->setWidgetResizable(true);
+  scroll->setFrameShape(QFrame::NoFrame);
+  auto *body = new QWidget;
+  auto *bodyLayout = new QVBoxLayout(body);
+  bodyLayout->setContentsMargins(0, 0, 0, 0);
+  bodyLayout->setSpacing(0);
+  const auto current = readSettings();
+  QList<QWidget *> rows;
+  for (const auto &[name, key, defaultValue] : options)
+    rows.append(row(name, {},
+                    toggle(current.value(key).toBool(defaultValue), true, key),
+                    48));
+  bodyLayout->addWidget(rowsCard(rows));
+  bodyLayout->addStretch();
+  scroll->setWidget(body);
+  layout->addWidget(scroll, 1);
+  dialog.exec();
+}
+
+static void runLanguageDialog(QWidget *owner) {
+  QDialog dialog(owner, Qt::Dialog | Qt::FramelessWindowHint);
+  dialog.setModal(true);
+  dialog.setObjectName("windowSurface");
+  dialog.setFixedSize(420, 190);
+  auto *layout = new QVBoxLayout(&dialog);
+  layout->setContentsMargins(20, 14, 20, 20);
+  auto *title = new QLabel("默认输入语言");
+  title->setObjectName("pageHeading");
+  title->setAlignment(Qt::AlignCenter);
+  layout->addWidget(title);
+  auto *chinese = new QRadioButton("中文");
+  auto *english = new QRadioButton("英文");
+  (readSettings().value("default_language").toString() == "english" ? english
+                                                                    : chinese)
+      ->setChecked(true);
+  layout->addWidget(rowsCard({radioRow(chinese), radioRow(english)}));
+  QObject::connect(chinese, &QRadioButton::toggled, [](bool checked) {
+    if (checked)
+      writeSetting("default_language", "chinese");
+  });
+  QObject::connect(english, &QRadioButton::toggled, [](bool checked) {
+    if (checked)
+      writeSetting("default_language", "english");
+  });
+  auto *close = greenButton("完成");
+  QObject::connect(close, &QPushButton::clicked, &dialog, &QDialog::accept);
+  layout->addWidget(close, 0, Qt::AlignRight);
+  dialog.exec();
+}
+
 int main(int argc, char **argv) {
   qunsetenv("WAYLAND_SOCKET");
   QApplication app(argc, argv);
@@ -488,12 +721,11 @@ int main(int argc, char **argv) {
   auto *navigation = new QListWidget;
   navigation->setObjectName("navigation");
   navigation->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-  const QStringList navNames = {"输入",   "语音输入", "常用语和剪贴板",
-                                "外观",   "快捷键",   "跨设备",
+  const QStringList navNames = {"输入",   "语音输入",  "常用语和剪贴板",
+                                "外观",   "快捷键",    "跨设备",
                                 "手机版", "升级和反馈"};
-  const QStringList navIcons = {"input",      "voice",     "phrases",
-                                "appearance", "shortcuts", "devices",
-                                "mobile",     "about"};
+  const QStringList navIcons = {"input",     "voice",   "phrases", "appearance",
+                                "shortcuts", "devices", "mobile",  "about"};
   for (int i = 0; i < navNames.size(); ++i) {
     auto *item = new QListWidgetItem(navIcon(navIcons[i]), navNames[i]);
     item->setSizeHint({190, 40});
@@ -511,8 +743,7 @@ int main(int argc, char **argv) {
   auto *rightLayout = new QVBoxLayout(right);
   rightLayout->setContentsMargins(0, 0, 0, 0);
   rightLayout->setSpacing(0);
-  auto *close =
-      new SourceIconButton(asset("icon_windows_close_btn"), right);
+  auto *close = new SourceIconButton(asset("icon_windows_close_btn"), right);
   close->setObjectName("closeButton");
   auto *pages = new QStackedWidget;
   rightLayout->addWidget(pages, 1);
@@ -539,13 +770,20 @@ int main(int argc, char **argv) {
   auto *doubleScheme = new QComboBox;
   doubleScheme->addItems(
       {"自然码", "搜狗", "微软", "小鹤", "拼音加加", "紫光", "智能 ABC"});
-  doubleScheme->setCurrentIndex(settings.value("double_pinyin_scheme").toInt(0));
+  doubleScheme->setCurrentIndex(
+      settings.value("double_pinyin_scheme").toInt(0));
   doubleScheme->setEnabled(doublePinyin->isChecked());
   auto *wubiScheme = new QComboBox;
   wubiScheme->addItems({"86 五笔", "98 五笔", "新世纪五笔"});
   wubiScheme->setCurrentIndex(settings.value("wubi_solution").toInt(0));
   auto *wubiSetup = new QPushButton("设置");
-  wubiSetup->setEnabled(false);
+  QObject::connect(wubiSetup, &QPushButton::clicked, [&window] {
+    runToggleDialog(&window, "五笔功能",
+                    {{"五笔拼音混输", "wubi_pinyin", false},
+                     {"唯一候选自动上屏", "wubi_unique_commit", false},
+                     {"输入下一码时上屏", "wubi_next_commit", false},
+                     {"通配符编码提示", "wubi_wildcard_comment", false}});
+  });
   input.body->addWidget(rowsCard(
       {radioRow(pinyin), radioRow(doublePinyin, doubleScheme),
        radioRow(wubi, wubiScheme), row("五笔功能", {}, wubiSetup, 44)}));
@@ -556,14 +794,20 @@ int main(int argc, char **argv) {
     writeSetting("keyboard", id == 5 ? 5 : 0);
     doubleScheme->setEnabled(id == 1);
   });
-  QObject::connect(doubleScheme, &QComboBox::currentIndexChanged,
-                   [](int value) {
-                     writeSetting("double_pinyin_scheme", value);
-                   });
+  QObject::connect(
+      doubleScheme, &QComboBox::currentIndexChanged,
+      [](int value) { writeSetting("double_pinyin_scheme", value); });
   QObject::connect(wubiScheme, &QComboBox::currentIndexChanged,
                    [](int value) { writeSetting("wubi_solution", value); });
   auto *emojiSetup = new QPushButton("设置...");
-  emojiSetup->setEnabled(false);
+  QObject::connect(emojiSetup, &QPushButton::clicked, [&window] {
+    runToggleDialog(&window, "表情和颜文字推荐",
+                    {{"微信表情", "wechat_emoji", true},
+                     {"Emoji", "normal_emoji", true},
+                     {"颜文字", "kaomoji", true},
+                     {"大表情", "large_emoji", true},
+                     {"符号表情", "symbol_emoji", true}});
+  });
   input.body->addWidget(
       rowsCard({row("智能拼写", "精准匹配候选词，大幅提升打字效率",
                     toggle(settings.value("smart_input").toBool(true), true,
@@ -571,22 +815,44 @@ int main(int argc, char **argv) {
                 row("表情和颜文字推荐", {}, emojiSetup, 50)}));
   auto *languageSetup = new QPushButton("设置..."),
        *fuzzySetup = new QPushButton("设置...");
-  languageSetup->setEnabled(false);
-  fuzzySetup->setEnabled(false);
-  input.body->addWidget(rowsCard(
-      {row("输入中文时，将「/?」按键替换为 、", {},
-           toggle(settings.value("slash_punctuation").toBool(true), true,
-                  "slash_punctuation"),
-           52),
-       row("符号自动转换",
-           "数字间部分符号处理为英文标点，例如 12：00 替换为 12:00",
-           toggle(settings.value("symbol_auto_change").toBool(true), true,
-                  "symbol_auto_change")),
-       row("符号自动补全", "自动补全成对符号的右半部分",
-           toggle(settings.value("symbol_auto_pair").toBool(true), true,
-                  "symbol_auto_pair")),
-       row("默认输入语言（中文/英文）", {}, languageSetup, 52),
-       row("模糊拼音", {}, fuzzySetup, 52)}));
+  QObject::connect(languageSetup, &QPushButton::clicked,
+                   [&window] { runLanguageDialog(&window); });
+  QObject::connect(fuzzySetup, &QPushButton::clicked, [&window] {
+    runToggleDialog(&window, "模糊拼音",
+                    {{"n/l", "fuzzy_nl", false},
+                     {"r/l", "fuzzy_rl", false},
+                     {"h/f", "fuzzy_hf", false},
+                     {"g/k", "fuzzy_gk", false},
+                     {"an/ang", "fuzzy_an_ang", false},
+                     {"ian/iang", "fuzzy_ian_iang", false},
+                     {"uan/uang", "fuzzy_uan_uang", false},
+                     {"c/ch", "fuzzy_c_ch", false},
+                     {"s/sh", "fuzzy_s_sh", false},
+                     {"z/zh", "fuzzy_z_zh", false},
+                     {"hui/fei", "fuzzy_hui_fei", false},
+                     {"en/eng", "fuzzy_en_eng", false},
+                     {"in/ing", "fuzzy_in_ing", false},
+                     {"on/ong", "fuzzy_on_ong", false},
+                     {"huang/wang", "fuzzy_huang_wang", false},
+                     {"un/ong", "fuzzy_un_ong", false},
+                     {"un/iong", "fuzzy_un_iong", false},
+                     {"an/ai", "fuzzy_an_ai", false},
+                     {"eng/ong", "fuzzy_eng_ong", false}});
+  });
+  input.body->addWidget(
+      rowsCard({row("输入中文时，将「/?」按键替换为 、", {},
+                    toggle(settings.value("slash_punctuation").toBool(true),
+                           true, "slash_punctuation"),
+                    52),
+                row("符号自动转换",
+                    "数字间部分符号处理为英文标点，例如 12：00 替换为 12:00",
+                    toggle(settings.value("symbol_auto_change").toBool(true),
+                           true, "symbol_auto_change")),
+                row("符号自动补全", "自动补全成对符号的右半部分",
+                    toggle(settings.value("symbol_auto_pair").toBool(true),
+                           true, "symbol_auto_pair")),
+                row("默认输入语言（中文/英文）", {}, languageSetup, 52),
+                row("模糊拼音", {}, fuzzySetup, 52)}));
   input.body->addWidget(rowsCard(
       {row("单机模式",
            "无需网络，单机离线使用。不支持跨设备、表情推荐、问 AI 等联网功能",
@@ -617,16 +883,59 @@ int main(int argc, char **argv) {
     voiceHeroLayout->addWidget(feature);
   }
   voice.body->addWidget(voiceHero);
-  voice.body->addWidget(
-      rowsCard({row("快捷键", {}, nullptr, 44),
-                shortcutRow("启动语音输入", settings.value("voice_launch_shortcut").toBool(true), {"Ctrl", "Win", "Shift", "×"},
-                            "按下可开启语音输入，按任意键均可结束", true, "voice_launch_shortcut"),
-                shortcutRow("按住说话", settings.value("voice_hold_shortcut").toBool(true), {"Ctrl", "Win", "×"},
-                            "按住可语音输入，松手结束", true, "voice_hold_shortcut")}));
+  voice.body->addWidget(rowsCard(
+      {row("快捷键", {}, nullptr, 44),
+       shortcutRow("启动语音输入",
+                   settings.value("voice_launch_shortcut").toBool(true),
+                   {"Ctrl", "Win", "Shift", "×"},
+                   "按下可开启语音输入，按任意键均可结束", true,
+                   "voice_launch_shortcut"),
+       shortcutRow("按住说话",
+                   settings.value("voice_hold_shortcut").toBool(true),
+                   {"Ctrl", "Win", "×"}, "按住可语音输入，松手结束", true,
+                   "voice_hold_shortcut")}));
   auto *microphone = new QComboBox;
   microphone->addItem("自动检测");
+  QProcess pipewire;
+  pipewire.start("pw-dump", {});
+  if (pipewire.waitForFinished(2000)) {
+    const auto nodes =
+        QJsonDocument::fromJson(pipewire.readAllStandardOutput()).array();
+    for (const auto &value : nodes) {
+      const auto object = value.toObject();
+      const auto info = object.value("info").toObject();
+      const auto props = info.value("props").toObject();
+      if (props.value("media.class").toString() != "Audio/Source")
+        continue;
+      const auto target = props.value("node.name").toString();
+      const auto name = props.value("node.description").toString(target);
+      if (!target.isEmpty())
+        microphone->addItem(name, target);
+    }
+  }
+  const auto savedMicrophone = settings.value("voice_microphone").toString();
+  if (!savedMicrophone.isEmpty()) {
+    const int index = microphone->findData(savedMicrophone);
+    if (index >= 0)
+      microphone->setCurrentIndex(index);
+  }
+  QObject::connect(
+      microphone, &QComboBox::currentIndexChanged, [microphone](int index) {
+        writeSetting("voice_microphone",
+                     index > 0
+                         ? QJsonValue::fromVariant(microphone->itemData(index))
+                         : QJsonValue("自动检测"));
+      });
   auto *punctuationMode = new QComboBox;
   punctuationMode->addItem("智能标点");
+  punctuationMode->addItem("添加完整标点");
+  punctuationMode->addItem("句末不加句号");
+  punctuationMode->addItem("空格替换标点");
+  punctuationMode->setCurrentText(
+      settings.value("voice_punctuation").toString("智能标点"));
+  QObject::connect(
+      punctuationMode, &QComboBox::currentTextChanged,
+      [](const QString &value) { writeSetting("voice_punctuation", value); });
   voice.body->addWidget(
       rowsCard({row("麦克风", "设置语音输入的默认麦克风", microphone),
                 row("标点设置", {}, punctuationMode),
@@ -666,12 +975,75 @@ int main(int argc, char **argv) {
   demoLayout->addWidget(new QLabel(
       "添加文字到「常用语」后，输入前 3 个字或其拼音首字母即可使用"));
   commonLayout->addWidget(demo);
+  auto *phraseList = new QListWidget;
+  phraseList->setFrameShape(QFrame::NoFrame);
+  phraseList->setAlternatingRowColors(false);
+  phraseList->setStyleSheet(
+      "QListWidget{background:white;border-radius:10px;padding:4px;}"
+      "QListWidget::item{min-height:42px;border-bottom:1px solid #eeeeee;}"
+      "QListWidget::item:selected{background:#dff8ef;color:#202124;} ");
   auto *addPhrase = greenButton("添加");
-  addPhrase->setEnabled(false);
-  addPhrase->setToolTip(
-      "添加/编辑弹窗尚未取得原版截图；原版后端 CRUD 保持可用");
-  commonLayout->addWidget(addPhrase, 0, Qt::AlignRight);
-  commonLayout->addStretch();
+  auto *editPhrase = new QPushButton("编辑"),
+       *deletePhrase = new QPushButton("删除");
+  auto *phraseButtons = new QHBoxLayout;
+  phraseButtons->addStretch();
+  phraseButtons->addWidget(deletePhrase);
+  phraseButtons->addWidget(editPhrase);
+  phraseButtons->addWidget(addPhrase);
+  commonLayout->addLayout(phraseButtons);
+  commonLayout->addWidget(phraseList, 1);
+  auto reloadPhrases = [phraseList, editPhrase, deletePhrase] {
+    QString error;
+    const auto result = hotwordRequest("hotword_list", {}, &error);
+    phraseList->clear();
+    for (const auto &value : result.value("hotwords").toArray()) {
+      const auto item = value.toObject();
+      auto *row = new QListWidgetItem(item.value("words").toString() + "    " +
+                                          item.value("key").toString(),
+                                      phraseList);
+      row->setData(Qt::UserRole, item);
+    }
+    if (!error.isEmpty())
+      phraseList->addItem(error);
+    const bool hasItems = phraseList->count() > 0;
+    phraseList->setVisible(hasItems);
+    editPhrase->setVisible(hasItems);
+    deletePhrase->setVisible(hasItems);
+  };
+  QObject::connect(addPhrase, &QPushButton::clicked, [&, reloadPhrases] {
+    if (editHotword(&window))
+      reloadPhrases();
+  });
+  QObject::connect(editPhrase, &QPushButton::clicked, [&, reloadPhrases] {
+    if (auto *current = phraseList->currentItem();
+        current &&
+        editHotword(&window, current->data(Qt::UserRole).toJsonObject()))
+      reloadPhrases();
+  });
+  QObject::connect(deletePhrase, &QPushButton::clicked, [&, reloadPhrases] {
+    auto *current = phraseList->currentItem();
+    if (!current)
+      return;
+    const auto item = current->data(Qt::UserRole).toJsonObject();
+    if (item.value("id").toString().isEmpty())
+      return;
+    QString error;
+    hotwordRequest(
+        "hotword_set",
+        {{"id", item.value("id").toString()}, {"key", ""}, {"words", ""}},
+        &error);
+    if (!error.isEmpty())
+      QMessageBox::warning(&window, "常用语", error);
+    else
+      reloadPhrases();
+  });
+  QObject::connect(
+      phraseList, &QListWidget::itemDoubleClicked,
+      [&, reloadPhrases](QListWidgetItem *item) {
+        if (editHotword(&window, item->data(Qt::UserRole).toJsonObject()))
+          reloadPhrases();
+      });
+  reloadPhrases();
   phraseStack->addWidget(common);
   auto *clipboard = new QWidget;
   auto *clipboardLayout = new QVBoxLayout(clipboard);
@@ -736,45 +1108,68 @@ int main(int argc, char **argv) {
   pages->addWidget(visual.widget);
 
   auto shortcuts = page("快捷键");
-  shortcuts.body->addWidget(
-      rowsCard({row("中英文切换", {}, nullptr, 44),
-                shortcutRow("使用 shift", settings.value("shift_switch").toBool(true), {"shift"}, {}, true, "shift_switch"),
-                shortcutRow("使用 ctrl", settings.value("ctrl_switch").toBool(false), {"ctrl"}, {}, true, "ctrl_switch")}));
+  shortcuts.body->addWidget(rowsCard(
+      {row("中英文切换", {}, nullptr, 44),
+       shortcutRow("使用 shift", settings.value("shift_switch").toBool(true),
+                   {"shift"}, {}, true, "shift_switch"),
+       shortcutRow("使用 ctrl", settings.value("ctrl_switch").toBool(false),
+                   {"ctrl"}, {}, true, "ctrl_switch")}));
   auto *defaultShortcut =
       new QLabel("系统默认支持“ctrl + 空格”切换中英文  修改");
   defaultShortcut->setObjectName("rowSubtitle");
   shortcuts.body->addWidget(defaultShortcut);
   shortcuts.body->addWidget(rowsCard(
       {row("快捷使用", {}, nullptr, 44),
-       shortcutRow("AI 助手  Beta", settings.value("ai_assistant").toBool(true), {"="},
-                   "输入后按「=」可使用 AI 提问、表情推荐等功能", true, "ai_assistant"),
+       shortcutRow("AI 助手  Beta", settings.value("ai_assistant").toBool(true),
+                   {"="}, "输入后按「=」可使用 AI 提问、表情推荐等功能", true,
+                   "ai_assistant"),
        shortcutRow(
-           "V 模式", true, {"V"},
-           "按「v」打开快捷功能栏，可使用计算、剪贴板、常用语、符号等功能", true, "v_mode")}));
-  shortcuts.body->addWidget(
-      rowsCard({row("语音输入", {}, nullptr, 44),
-                shortcutRow("启动语音输入", settings.value("voice_launch_shortcut").toBool(true), {"Ctrl", "Win", "Shift", "×"},
-                            "按下可开启语音输入，按任意键均可结束", true, "voice_launch_shortcut"),
-                shortcutRow("按住说话", settings.value("voice_hold_shortcut").toBool(true), {"Ctrl", "Win", "×"},
-                            "按住可语音输入，松手结束", true, "voice_hold_shortcut")}));
-  shortcuts.body->addWidget(
-      rowsCard({row("输入状态切换", {}, nullptr, 44),
-                shortcutRow("全半角输入切换", settings.value("half_full_switch").toBool(false),
-                            {"shift", "backslash-icon"}, {}, true, "half_full_switch"),
-                shortcutRow("中文下中英标点切换", settings.value("punctuation_switch").toBool(true), {"ctrl", "。"}, {}, true, "punctuation_switch"),
-                shortcutRow("简繁体输入切换", settings.value("traditional_switch").toBool(false), {"ctrl", "shift", "F"}, {}, true, "traditional_switch")}));
+           "V 模式", settings.value("v_mode").toBool(true), {"V"},
+           "按「v」打开快捷功能栏，可使用计算、剪贴板、常用语、符号等功能",
+           true, "v_mode")}));
+  shortcuts.body->addWidget(rowsCard(
+      {row("语音输入", {}, nullptr, 44),
+       shortcutRow("启动语音输入",
+                   settings.value("voice_launch_shortcut").toBool(true),
+                   {"Ctrl", "Win", "Shift", "×"},
+                   "按下可开启语音输入，按任意键均可结束", true,
+                   "voice_launch_shortcut"),
+       shortcutRow("按住说话",
+                   settings.value("voice_hold_shortcut").toBool(true),
+                   {"Ctrl", "Win", "×"}, "按住可语音输入，松手结束", true,
+                   "voice_hold_shortcut")}));
+  shortcuts.body->addWidget(rowsCard(
+      {row("输入状态切换", {}, nullptr, 44),
+       shortcutRow("全半角输入切换",
+                   settings.value("half_full_switch").toBool(false),
+                   {"shift", "backslash-icon"}, {}, true, "half_full_switch"),
+       shortcutRow("中文下中英标点切换",
+                   settings.value("punctuation_switch").toBool(true),
+                   {"ctrl", "。"}, {}, true, "punctuation_switch"),
+       shortcutRow("简繁体输入切换",
+                   settings.value("traditional_switch").toBool(false),
+                   {"ctrl", "shift", "F"}, {}, true, "traditional_switch")}));
   shortcuts.body->addWidget(rowsCard(
       {row("翻页按字", {}, new QLabel("向上翻　向下翻"), 44),
-       shortcutRow("减号等号", settings.value("page_minus_equal").toBool(true), {"−", "="}, {}, true, "page_minus_equal"),
-       shortcutRow("左右中括号", settings.value("page_brackets").toBool(true), {"[", "]"}, {}, true, "page_brackets"),
-       shortcutRow("逗号句号", settings.value("page_comma_period").toBool(false), {"，", "。"}, {}, true, "page_comma_period"),
-       shortcutRow("shift + tab / tab", settings.value("page_shift_tab").toBool(false), {"shift + tab", "tab"}, {}, true, "page_shift_tab")}));
-  shortcuts.body->addWidget(
-      rowsCard({row("候选词选择", {}, nullptr, 44),
-                shortcutRow("使用分号、引号选择第 2 位、第 3 位候选词", settings.value("select_semicolon_quote").toBool(false),
-                            {"；", "’"}, {}, true, "select_semicolon_quote"),
-                shortcutRow("使用左、右 ctrl 选择第 2 位、第 3 位候选词", settings.value("select_ctrl").toBool(false),
-                            {"ctrl", "backslash-icon", "ctrl"}, {}, true, "select_ctrl")}));
+       shortcutRow("减号等号", settings.value("page_minus_equal").toBool(true),
+                   {"−", "="}, {}, true, "page_minus_equal"),
+       shortcutRow("左右中括号", settings.value("page_brackets").toBool(true),
+                   {"[", "]"}, {}, true, "page_brackets"),
+       shortcutRow("逗号句号",
+                   settings.value("page_comma_period").toBool(false),
+                   {"，", "。"}, {}, true, "page_comma_period"),
+       shortcutRow("shift + tab / tab",
+                   settings.value("page_shift_tab").toBool(false),
+                   {"shift + tab", "tab"}, {}, true, "page_shift_tab")}));
+  shortcuts.body->addWidget(rowsCard(
+      {row("候选词选择", {}, nullptr, 44),
+       shortcutRow("使用分号、引号选择第 2 位、第 3 位候选词",
+                   settings.value("select_semicolon_quote").toBool(false),
+                   {"；", "’"}, {}, true, "select_semicolon_quote"),
+       shortcutRow("使用左、右 ctrl 选择第 2 位、第 3 位候选词",
+                   settings.value("select_ctrl").toBool(false),
+                   {"ctrl", "backslash-icon", "ctrl"}, {}, true,
+                   "select_ctrl")}));
   pages->addWidget(shortcuts.widget);
 
   auto devices = page("跨设备");
@@ -783,14 +1178,17 @@ int main(int argc, char **argv) {
       "/fcitx5-wetypex/state/sync-state.json");
   const qint64 syncGroup = syncState.value("group_id").toInteger();
   const int syncFunctions = syncState.value("func_switch").toInt();
+  const bool syncAvailable =
+      syncGroup > 0 && !settings.value("standalone").toBool(false);
   auto *deviceHero = new QWidget;
   auto *deviceHeroLayout = new QHBoxLayout(deviceHero);
   deviceHeroLayout->setContentsMargins(82, 0, 82, 0);
   auto deviceImage = [](const QString &name, const QSize &size) {
     auto *label = new QLabel;
     label->setFixedSize(size);
-    label->setPixmap(QPixmap(imageAsset(name)).scaled(
-        size, Qt::KeepAspectRatio, Qt::SmoothTransformation));
+    label->setPixmap(
+        QPixmap(imageAsset(name))
+            .scaled(size, Qt::KeepAspectRatio, Qt::SmoothTransformation));
     label->setAlignment(Qt::AlignCenter);
     return label;
   };
@@ -806,6 +1204,7 @@ int main(int argc, char **argv) {
   deviceHero->setStyleSheet("font-size:20px;background:transparent;");
   devices.body->addWidget(deviceHero);
   auto *transfer = greenButton("传文件");
+  transfer->setEnabled(!settings.value("standalone").toBool(false));
   QObject::connect(transfer, &QPushButton::clicked, [] {
     QProcess::startDetached(QStringLiteral(WETYPE_TRANSFER), {});
   });
@@ -813,7 +1212,7 @@ int main(int argc, char **argv) {
   auto *dictionarySync = new Toggle(syncFunctions & 4);
   auto *phraseSync = new Toggle(syncFunctions & 2);
   for (auto *control : {clipboardSync, dictionarySync, phraseSync})
-    control->setEnabled(syncGroup > 0);
+    control->setEnabled(syncAvailable);
   auto updateFunctions = [=, &window](bool) {
     const int mask = (clipboardSync->isChecked() ? 1 : 0) |
                      (phraseSync->isChecked() ? 2 : 0) |
@@ -823,34 +1222,31 @@ int main(int argc, char **argv) {
     writeSetting("device_phrase_sync", phraseSync->isChecked());
     for (auto *control : {clipboardSync, dictionarySync, phraseSync})
       control->setEnabled(false);
-    runAccount(&window,
-               {"set-functions", QString::number(syncGroup),
-                QString::number(mask)},
-               [=](int code, const QJsonObject &result) {
-                 const bool ok = !code && result.value("ok").toBool();
-                 if (!ok) {
-                   QSignalBlocker a(clipboardSync), b(dictionarySync),
-                       c(phraseSync);
-                   clipboardSync->setChecked(syncFunctions & 1);
-                   phraseSync->setChecked(syncFunctions & 2);
-                   dictionarySync->setChecked(syncFunctions & 4);
-                 }
-                 for (auto *control :
-                      {clipboardSync, dictionarySync, phraseSync})
-                   control->setEnabled(syncGroup > 0);
-               });
+    runAccount(
+        &window,
+        {"set-functions", QString::number(syncGroup), QString::number(mask)},
+        [=](int code, const QJsonObject &result) {
+          const bool ok = !code && result.value("ok").toBool();
+          if (!ok) {
+            QSignalBlocker a(clipboardSync), b(dictionarySync), c(phraseSync);
+            clipboardSync->setChecked(syncFunctions & 1);
+            phraseSync->setChecked(syncFunctions & 2);
+            dictionarySync->setChecked(syncFunctions & 4);
+          }
+          for (auto *control : {clipboardSync, dictionarySync, phraseSync})
+            control->setEnabled(syncAvailable);
+        });
   };
   QObject::connect(clipboardSync, &QAbstractButton::toggled, updateFunctions);
   QObject::connect(dictionarySync, &QAbstractButton::toggled, updateFunctions);
   QObject::connect(phraseSync, &QAbstractButton::toggled, updateFunctions);
   devices.body->addWidget(rowsCard(
       {iconRow("icon_transfer_copy", "跨设备复制粘贴",
-               "在电脑复制文字、图片后，手机上可立即粘贴",
-               clipboardSync),
+               "在电脑复制文字、图片后，手机上可立即粘贴", clipboardSync),
        iconRow("icon_transfer_glossary", "个人词库同步",
                "关联设备之间同步个人词库", dictionarySync),
-       iconRow("icon_transfer_common", "常用语同步",
-               "关联设备之间同步常用语", phraseSync),
+       iconRow("icon_transfer_common", "常用语同步", "关联设备之间同步常用语",
+               phraseSync),
        iconRow("icon_transfer_filetransfer", "隔空传送",
                "跨设备发送图片、视频和文件", transfer)}));
   auto *deviceLabel = new QLabel("我的设备");
@@ -858,7 +1254,10 @@ int main(int argc, char **argv) {
   devices.body->addWidget(deviceLabel);
   auto *matchCode = greenButton("查看匹配码"),
        *mobileDownload = greenButton("下载手机版");
-  mobileDownload->setEnabled(false);
+  matchCode->setEnabled(!settings.value("standalone").toBool(false));
+  QObject::connect(mobileDownload, &QPushButton::clicked, [] {
+    QDesktopServices::openUrl(QUrl("https://z.weixin.qq.com/"));
+  });
   QString localModel;
   QFile modelFile("/sys/class/dmi/id/product_name");
   if (modelFile.open(QIODevice::ReadOnly))
@@ -877,19 +1276,19 @@ int main(int argc, char **argv) {
     const QString icon = platform == 1   ? "icon_transfer_android_mini.png"
                          : platform == 2 ? "icon_transfer_ios_mini.png"
                                          : "icon_transfer_computer_mini.png";
-    deviceRows.append(iconRow(icon, name,
-                              device.value("client_version").toString(),
-                              nullptr, 58));
+    deviceRows.append(iconRow(
+        icon, name, device.value("client_version").toString(), nullptr, 58));
   }
   if (!syncGroup)
-    deviceRows.append(iconRow(
-        "icon_transfer_ios_mini.png",
-        "关联 iOS/Android 版本即可体验跨设备同步", {}, mobileDownload));
+    deviceRows.append(iconRow("icon_transfer_ios_mini.png",
+                              "关联 iOS/Android 版本即可体验跨设备同步", {},
+                              mobileDownload));
   devices.body->addWidget(rowsCard(deviceRows));
   auto *associate = new QPushButton("关联设备");
   associate->setIcon(QIcon(asset("icon_sync_device")));
   associate->setStyleSheet("color:#00bf83;border:1px solid "
                            "#e9e9e9;background:white;min-height:42px;");
+  associate->setEnabled(!settings.value("standalone").toBool(false));
   auto showPairing = [&window] {
     if (window.findChild<QWidget *>("pairingOverlay"))
       return;
@@ -920,6 +1319,11 @@ int main(int argc, char **argv) {
   androidDownload->setIcon(QIcon(asset("icon_entry_android")));
   downloadRow->addWidget(iosDownload);
   downloadRow->addWidget(androidDownload);
+  auto openMobileDownload = [] {
+    QDesktopServices::openUrl(QUrl("https://z.weixin.qq.com/"));
+  };
+  QObject::connect(iosDownload, &QPushButton::clicked, openMobileDownload);
+  QObject::connect(androidDownload, &QPushButton::clicked, openMobileDownload);
   mobile.body->addLayout(downloadRow);
   pages->addWidget(mobile.widget);
 
@@ -937,9 +1341,19 @@ int main(int argc, char **argv) {
   version->setObjectName("rowSubtitle");
   version->setAlignment(Qt::AlignCenter);
   about.body->addWidget(version);
+  auto *feedback = new QToolButton;
+  feedback->setIcon(QIcon(asset("icon_about_arrow")));
+  feedback->setStyleSheet("border:0;background:transparent;");
+  QObject::connect(feedback, &QToolButton::clicked, [] {
+    QDesktopServices::openUrl(
+        QUrl("https://github.com/panxuc/fcitx5-wetypex/issues"));
+  });
   about.body->addWidget(
-      rowsCard({row("有新版本时自动更新", {}, toggle(true, false), 48),
-                row("我要反馈", {}, iconLabel("icon_about_arrow", 18), 48)}));
+      rowsCard({row("有新版本时自动更新", {},
+                    toggle(settings.value("auto_update").toBool(true), true,
+                           "auto_update"),
+                    48),
+                row("我要反馈", {}, feedback, 48)}));
   about.body->addStretch();
   auto *copyright =
       new QLabel("WeTypeX 社区项目\n原版核心及相关商标归其权利人所有\n"
@@ -960,13 +1374,5 @@ int main(int argc, char **argv) {
     close->raise();
     close->show();
   });
-  if (args.contains("--show-pairing"))
-    QTimer::singleShot(0, showPairing);
-  int screenshot = args.indexOf("--screenshot");
-  if (screenshot >= 0 && screenshot + 1 < args.size())
-    QTimer::singleShot(args.contains("--show-pairing") ? 6000 : 500, [&] {
-      window.grab().save(args[screenshot + 1]);
-      app.quit();
-    });
   return app.exec();
 }

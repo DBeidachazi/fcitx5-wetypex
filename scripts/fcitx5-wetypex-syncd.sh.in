@@ -51,6 +51,7 @@ except (OSError, json.JSONDecodeError):
 last_remote_version = int(runtime.get("remote_version", 0))
 last_outbox_id = str(runtime.get("outbox_id", ""))
 last_image_digest = str(runtime.get("image_digest", ""))
+last_text_digest = str(runtime.get("text_digest", ""))
 once = "--once" in sys.argv
 clipboard_owner = None
 wl_copy = shutil.which("wl-copy") if os.environ.get("WAYLAND_DISPLAY") else None
@@ -63,49 +64,29 @@ while True:
         group_id = int(group.get("group_id", 0))
         functions = int(group.get("func_switch", 0))
         if group_id and functions & 1:
-            outbox_path = state_dir / "clipboard-outbox.json"
-            try:
-                outbox = json.loads(outbox_path.read_text())
-            except (OSError, json.JSONDecodeError):
-                outbox = {}
-            outbox_id = str(outbox.get("id", ""))
-            text = str(outbox.get("text", ""))
-            if outbox_id and outbox_id != last_outbox_id and text:
-                sent = call("send-clipboard", str(group_id), text)
-                if sent.get("ok"):
-                    last_outbox_id = outbox_id
             helper_environment = os.environ.copy()
             helper_environment["QT_IM_MODULE"] = "none"
-            try:
-                local_image = subprocess.run(
-                    ([wl_paste, "--no-newline", "--type", "image/png"]
-                     if wl_paste else [clipboard_helper, "--read-image"]),
-                    capture_output=True, timeout=4, env=helper_environment)
-            except subprocess.TimeoutExpired:
-                local_image = None
-            if (local_image and local_image.returncode == 0 and
-                    0 < len(local_image.stdout) <= 8388608):
-                digest = hashlib.sha256(local_image.stdout).hexdigest()
-                if digest != last_image_digest:
-                    image_path = state_dir / "clipboard-outbox.png"
-                    temporary = image_path.with_suffix(".png.tmp")
-                    temporary.write_bytes(local_image.stdout)
-                    temporary.chmod(0o600)
-                    temporary.replace(image_path)
-                    sent = call("send-image", str(group_id), str(image_path))
-                    if sent.get("ok"):
-                        last_image_digest = digest
             version = int(group.get("clipboard_version", 0))
             remote = str(group.get("clipboard", ""))
             remote_type = int(group.get("clipboard_type", 0))
             remote_binary = str(group.get("clipboard_binary", ""))
-            if (version > last_remote_version and remote_type == 5 and
+            received_remote = False
+            if (version > last_remote_version and remote_type in (5, 6, 100) and
                     remote_binary):
                 try:
                     image = base64.b64decode(remote_binary, validate=True)
                 except (ValueError, base64.binascii.Error):
                     image = b""
                 if 0 < len(image) <= 8388608:
+                    normalized = subprocess.run(
+                        [clipboard_helper, "--normalize-image"], input=image,
+                        capture_output=True, timeout=4,
+                        env=helper_environment)
+                    if normalized.returncode != 0 or not normalized.stdout:
+                        image = b""
+                    else:
+                        image = normalized.stdout
+                if image:
                     if wl_copy:
                         subprocess.run([wl_copy, "--type", "image/png"],
                                        input=image, timeout=4,
@@ -123,7 +104,8 @@ while True:
                         clipboard_owner.stdin.close()
                     last_image_digest = hashlib.sha256(image).hexdigest()
                     last_remote_version = version
-            elif version > last_remote_version and remote and remote != text:
+                    received_remote = True
+            elif version > last_remote_version and remote:
                 atomic_json(state_dir / "clipboard-inbox.json",
                             {"version": version, "text": remote})
                 if clipboard_owner and clipboard_owner.poll() is None:
@@ -134,10 +116,70 @@ while True:
                     env=helper_environment)
                 clipboard_owner.stdin.write(remote.encode())
                 clipboard_owner.stdin.close()
+                last_text_digest = hashlib.sha256(remote.encode()).hexdigest()
                 last_remote_version = version
+                received_remote = True
+
+            outbox_path = state_dir / "clipboard-outbox.json"
+            try:
+                outbox = json.loads(outbox_path.read_text())
+            except (OSError, json.JSONDecodeError):
+                outbox = {}
+            outbox_id = str(outbox.get("id", ""))
+            text = str(outbox.get("text", ""))
+            if received_remote and outbox_id:
+                last_outbox_id = outbox_id
+            elif outbox_id and outbox_id != last_outbox_id and text:
+                sent = call("send-clipboard", str(group_id), text)
+                if sent.get("ok"):
+                    last_outbox_id = outbox_id
+                    last_text_digest = hashlib.sha256(text.encode()).hexdigest()
+            if not received_remote:
+                try:
+                    local_text = subprocess.run(
+                        ([wl_paste, "--no-newline"]
+                         if wl_paste else [clipboard_helper, "--read-text"]),
+                        capture_output=True, timeout=4, env=helper_environment)
+                except subprocess.TimeoutExpired:
+                    local_text = None
+                if (local_text and local_text.returncode == 0 and
+                        0 < len(local_text.stdout) <= 16384):
+                    try:
+                        clipboard_text = local_text.stdout.decode("utf-8")
+                    except UnicodeDecodeError:
+                        clipboard_text = ""
+                    digest = hashlib.sha256(local_text.stdout).hexdigest()
+                    if not last_text_digest:
+                        # Enabling sync does not upload unrelated clipboard data
+                        # that predates the setting. Changes after this baseline do.
+                        last_text_digest = digest
+                    elif clipboard_text and digest != last_text_digest:
+                        sent = call("send-clipboard", str(group_id), clipboard_text)
+                        if sent.get("ok"):
+                            last_text_digest = digest
+                try:
+                    local_image = subprocess.run(
+                        ([wl_paste, "--no-newline", "--type", "image/png"]
+                         if wl_paste else [clipboard_helper, "--read-image"]),
+                        capture_output=True, timeout=4, env=helper_environment)
+                except subprocess.TimeoutExpired:
+                    local_image = None
+                if (local_image and local_image.returncode == 0 and
+                        0 < len(local_image.stdout) <= 8388608):
+                    digest = hashlib.sha256(local_image.stdout).hexdigest()
+                    if digest != last_image_digest:
+                        image_path = state_dir / "clipboard-outbox.png"
+                        temporary = image_path.with_suffix(".png.tmp")
+                        temporary.write_bytes(local_image.stdout)
+                        temporary.chmod(0o600)
+                        temporary.replace(image_path)
+                        sent = call("send-image", str(group_id), str(image_path))
+                        if sent.get("ok"):
+                            last_image_digest = digest
             atomic_json(runtime_path, {"remote_version": last_remote_version,
                                        "outbox_id": last_outbox_id,
-                                       "image_digest": last_image_digest})
+                                       "image_digest": last_image_digest,
+                                       "text_digest": last_text_digest})
     if once:
         break
     time.sleep(3 if group.get("ok") else 10)

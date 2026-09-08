@@ -16,7 +16,9 @@ WeTypeX 将原版桌面输入核心接入 Fcitx5，同时让 Linux 桌面负责�
 | `fcitx5-wetypex-backend` | 在 Bubblewrap 中启动持久输入服务 |
 | `fcitx5-wetypex-account` | 执行配对、设备组、同步、语音和传输业务请求 |
 | `fcitx5-wetypex-syncd` | 轮询设备组并交换剪贴板内容 |
+| `fcitx5-wetypex-transfer` | 生成官方二维码、发布临时 CA 与连接角色，并驱动原版 Flurry LAN/WXP2P 文件通道 |
 | `fcitx5-wetypex-settings` | 独立设置窗口，与 Fcitx5 配置页共用配置 |
+| `libwetypexconfig.so` | Fcitx5 Qt6 配置页中的完整设置、账号与同步入口 |
 | `fcitx5-wetypex-ai` | 调用原版 AI 服务并打开问答窗口 |
 | `fcitx5-wetypex-voice` | PipeWire 录音、Opus 编码和识别结果投递 |
 
@@ -54,12 +56,16 @@ WeTypeX 将原版桌面输入核心接入 Fcitx5，同时让 Linux 桌面负责�
 
 AI 使用目标应用的 surrounding text 作为问题。原版服务返回服务器渲染的 HTML；Linux 窗口移除依赖 `WKWebView` 消息桥的渐显脚本，保留正文和 Markdown 样式。窗口通用图标由设置工具从官方包提取，不随仓库发布。
 
+## 隔空传送
+
+传输窗口先同时预加载原版 Flurry 与 WXP2P 动态库，再调用 Flurry 生成会话 CA。二维码发起端向官方业务服务提交 CA、`preferred_client=false` 的角色信息、局域网地址、设备名和功能位；iOS/Android 扫码端以 `preferred_client=true` 加入。官方服务返回双方各自的 `dispatch_buf` 后，桌面端立即把未经改写的调度数据交给 `FlurryWXP2P`。
+
+发现扫码设备后，桌面端同时使用对端 CA 启动 Flurry LAN 服务端，生成包含随机端口与服务名的 `GrpcNetInfo` JSON，并通过第二次 Join 请求更新本端信息。这一阶段与移动端实现一致；双方会优先采用可用的局域网通道，并保留 WXP2P 的公网打洞和腾讯中继作为备用。
+
+文件分片、应用层 ACK、校验、重名处理和进度均由原版 Flurry 实现。Linux 兼容宿主负责 Darwin 套接字、kqueue、线程、时间和文件 ABI；跨文件系统落盘使用同目标目录内的临时文件完成原子复制，再删除分片。连接失败后仍继续轮询同一传输码，手机重试产生新调度数据时会重建传输会话。
+
 ## 沙箱与文件权限
 
 输入和账户宿主运行在 Bubblewrap 容器中，只读绑定系统库、证书与已准备运行时，可写目录限于对应状态目录。离线模式额外隔离网络命名空间。账户、AI、语音和剪贴板状态使用 `0700` 目录与 `0600` 文件。
 
 WeTypeX 不把用户文本发送到自建服务器。启用云候选、同步、语音或 AI 时，相关内容会进入原版腾讯服务；单机模式关闭这些联网能力。
-
-## 尚未闭合的边界
-
-隔空传送可以创建会话码、二维码并轮询对端，但 `dispatch_buf` 对应的 P2P 文件字节层尚未接入。V 模式的计算、剪贴板、常用语和符号工具面板也未完成。
