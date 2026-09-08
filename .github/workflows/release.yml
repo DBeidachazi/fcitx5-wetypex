@@ -165,7 +165,7 @@ jobs:
               cd "$HOME/aur"
               version="${RELEASE_TAG#v}"
               sed -i "s/^pkgver=.*/pkgver=$version/" PKGBUILD
-              source_url="https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${RELEASE_TAG}.tar.gz"
+              source_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/fcitx5-wetypex-${version}.tar.gz"
               digest="$(curl -fsSL "$source_url" | sha256sum | cut -d" " -f1)"
               sed -i "s/^sha256sums=.*/sha256sums=(\"$digest\" \"SKIP\")/" PKGBUILD
               makepkg --printsrcinfo > .SRCINFO
