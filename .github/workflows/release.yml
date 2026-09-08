@@ -47,7 +47,7 @@ jobs:
             -e CMAKE_BUILD_PARALLEL_LEVEL=2 \
             -v "$PWD:/src:ro" -v "$PWD/dist:/out" \
             archlinux:base-devel bash -euc '
-              pacman -Syu --noconfirm git cmake clang fcitx5 libime libc++ \
+              pacman -Syu --noconfirm git cmake clang boost fcitx5 libime libc++ \
                 json-c curl bubblewrap util-linux python qt6-base qt6-svg \
                 qt6-webengine pipewire ffmpeg wl-clipboard
               useradd -m builder
