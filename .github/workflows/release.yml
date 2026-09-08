@@ -26,7 +26,7 @@ jobs:
     env:
       RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.tag || github.ref_name }}
 
@@ -39,9 +39,10 @@ jobs:
       - name: 安装发布工具
         run: sudo apt-get update && sudo apt-get install -y zstd
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version: stable
+          cache: false
 
       - name: 安装 nFPM
         run: |
@@ -91,7 +92,7 @@ jobs:
           )
 
       - name: 保存构建产物
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fcitx5-wetypex-${{ inputs.tag || github.ref_name }}
           path: |
@@ -132,7 +133,7 @@ jobs:
     env:
       RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.tag || github.ref_name }}
       - name: 安装 AUR 发布工具
