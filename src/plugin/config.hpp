@@ -27,19 +27,35 @@ FCITX_CONFIGURATION(
                                             DoublePinyinScheme::Ziranma};
     Option<WubiScheme> wubi{this, "Wubi", "五笔方案", WubiScheme::Wubi86};
     Option<bool> smartInput{this, "SmartInput", "智能拼写", true};
-    Option<bool> emojiRecommend{this, "EmojiRecommend", "表情和颜文字推荐", true};
-    Option<bool> slashPunctuation{this, "SlashPunctuation", "输入中文时将 /? 替换为 、", true};
-    Option<bool> symbolAutoChange{this, "SymbolAutoChange", "符号自动转换", true};
+    Option<bool> emojiRecommend{this, "EmojiRecommend", "表情和颜文字推荐",
+                                true};
+    Option<bool> slashPunctuation{this, "SlashPunctuation",
+                                  "输入中文时将 /? 替换为 、", true};
+    Option<bool> symbolAutoChange{this, "SymbolAutoChange", "符号自动转换",
+                                  true};
     Option<bool> symbolAutoPair{this, "SymbolAutoPair", "符号自动补全", true};
-    Option<DefaultLanguage> defaultLanguage{this, "DefaultLanguage", "默认输入语言",
-                                            DefaultLanguage::Chinese};
+    Option<DefaultLanguage> defaultLanguage{
+        this, "DefaultLanguage", "默认输入语言", DefaultLanguage::Chinese};
     Option<bool> fuzzyNl{this, "FuzzyNl", "模糊拼音 n/l", false};
     Option<bool> fuzzyRl{this, "FuzzyRl", "模糊拼音 r/l", false};
     Option<bool> fuzzyHf{this, "FuzzyHf", "模糊拼音 h/f", false};
     Option<bool> fuzzyGk{this, "FuzzyGk", "模糊拼音 g/k", false};
+    Option<bool> fuzzyAnAng{this, "FuzzyAnAng", "模糊拼音 an/ang", false};
+    Option<bool> fuzzyIanIang{this, "FuzzyIanIang", "模糊拼音 ian/iang", false};
+    Option<bool> fuzzyUanUang{this, "FuzzyUanUang", "模糊拼音 uan/uang", false};
     Option<bool> fuzzyCCh{this, "FuzzyCCh", "模糊拼音 c/ch", false};
     Option<bool> fuzzySSh{this, "FuzzySSh", "模糊拼音 s/sh", false};
     Option<bool> fuzzyZZh{this, "FuzzyZZh", "模糊拼音 z/zh", false};
+    Option<bool> fuzzyHuiFei{this, "FuzzyHuiFei", "模糊拼音 hui/fei", false};
+    Option<bool> fuzzyEnEng{this, "FuzzyEnEng", "模糊拼音 en/eng", false};
+    Option<bool> fuzzyInIng{this, "FuzzyInIng", "模糊拼音 in/ing", false};
+    Option<bool> fuzzyOnOng{this, "FuzzyOnOng", "模糊拼音 on/ong", false};
+    Option<bool> fuzzyHuangWang{this, "FuzzyHuangWang", "模糊拼音 huang/wang",
+                                false};
+    Option<bool> fuzzyUnOng{this, "FuzzyUnOng", "模糊拼音 un/ong", false};
+    Option<bool> fuzzyUnIong{this, "FuzzyUnIong", "模糊拼音 un/iong", false};
+    Option<bool> fuzzyAnAi{this, "FuzzyAnAi", "模糊拼音 an/ai", false};
+    Option<bool> fuzzyEngOng{this, "FuzzyEngOng", "模糊拼音 eng/ong", false};
     Option<bool> standalone{this, "Standalone", "单机模式", false};)
 
 FCITX_CONFIGURATION(

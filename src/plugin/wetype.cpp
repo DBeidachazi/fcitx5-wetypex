@@ -1,5 +1,6 @@
 #include "../common/json.hpp"
 #include "config.hpp"
+#include <algorithm>
 #include <cerrno>
 #include <clipboard_public.h>
 #include <csignal>
@@ -32,6 +33,7 @@
 #include <queue>
 #include <spawn.h>
 #include <string>
+#include <string_view>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -40,6 +42,67 @@
 extern char **environ;
 namespace {
 using namespace fcitx;
+struct PunctuationEntry {
+  char ascii;
+  const char *full;
+  const char *englishFull;
+  const char *normal;
+  const char *chineseHalf;
+  const char *englishHalf;
+  uint8_t pairType;
+};
+// Recovered from macOS 2.2.3.657 Contents/Resources/punctuation.json.
+static constexpr PunctuationEntry kPunctuation[] = {
+    {' ', "　", "　", " ", " ", " ", 0},
+    {'!', "！", "！", "！", "!", "!", 0},
+    {'\"', "“”", "＂＂", "“”", "“”", "\"\"", 2},
+    {'#', "＃", "＃", "#", "#", "#", 0},
+    {'$', "＄", "＄", "¥", "¥", "$", 0},
+    {'%', "％", "％", "%", "%", "%", 0},
+    {'&', "＆", "＆", "&", "&", "&", 0},
+    {'\'', "‘’", "＇＇", "‘’", "‘’", "''", 2},
+    {'(', "（）", "（）", "（）", "()", "()", 1},
+    {')', "）", "）", "）", ")", ")", 0},
+    {'*', "＊", "＊", "*", "*", "*", 0},
+    {'+', "＋", "＋", "+", "+", "+", 0},
+    {',', "，", "，", "，", ",", ",", 0},
+    {'-', "－", "－", "-", "-", "-", 0},
+    {'.', "。", "．", "。", ".", ".", 0},
+    {'/', "／", "／", "/", "/", "/", 0},
+    {':', "：", "：", "：", ":", ":", 0},
+    {';', "；", "；", "；", ";", ";", 0},
+    {'<', "《》", "＜＞", "《》", "《》", "<>", 1},
+    {'=', "＝", "＝", "=", "=", "=", 0},
+    {'>', "》", "＞", "》", "》", ">", 0},
+    {'?', "？", "？", "？", "?", "?", 0},
+    {'@', "＠", "＠", "@", "@", "@", 0},
+    {'[', "［］", "［］", "【】", "[]", "[]", 1},
+    {'\\', "、", "＼", "、", "、", "\\", 0},
+    {']', "］", "］", "】", "]", "]", 0},
+    {'^', "＾", "＾", "……", "……", "^", 0},
+    {'_', "＿", "＿", "——", "——", "_", 0},
+    {'`', "·", "｀", "·", "·", "`", 0},
+    {'{', "「」", "｛｝", "「」", "「」", "{}", 1},
+    {'|', "｜", "｜", "｜", "|", "|", 0},
+    {'}', "」", "｝", "」", "」", "}", 0},
+    {'~', "～", "～", "～", "~", "~", 0},
+};
+static const PunctuationEntry *punctuationEntry(char ascii) {
+  auto it =
+      std::find_if(std::begin(kPunctuation), std::end(kPunctuation),
+                   [ascii](const auto &entry) { return entry.ascii == ascii; });
+  return it == std::end(kPunctuation) ? nullptr : it;
+}
+static size_t firstUtf8Size(std::string_view text) {
+  if (text.empty())
+    return 0;
+  const auto byte = static_cast<unsigned char>(text.front());
+  return byte < 0x80 ? 1 : byte < 0xe0 ? 2 : byte < 0xf0 ? 3 : 4;
+}
+static std::pair<std::string, std::string> splitPair(const std::string &text) {
+  const auto first = std::min(firstUtf8Size(text), text.size());
+  return {text.substr(0, first), text.substr(first)};
+}
 static std::string formatPinyinPreedit(const std::string &raw) {
   auto begin = std::find_if(raw.begin(), raw.end(), [](unsigned char c) {
     return (c >= 'a' && c <= 'z') || c == '\'';
@@ -100,17 +163,50 @@ static std::string formatPinyinPreedit(const std::string &raw) {
   }
   return result;
 }
+static size_t displayCursorForRaw(const std::string &raw,
+                                  const std::string &displayed,
+                                  size_t rawCursor) {
+  rawCursor = std::min(rawCursor, raw.size());
+  size_t source = 0, display = 0;
+  while (source < rawCursor && display < displayed.size()) {
+    if (displayed[display] == '\'' &&
+        (source >= raw.size() || raw[source] != '\'')) {
+      ++display;
+      continue;
+    }
+    ++source;
+    ++display;
+  }
+  while (display < displayed.size() && displayed[display] == '\'' &&
+         (source >= raw.size() || raw[source] != '\''))
+    ++display;
+  return display;
+}
 class WeType;
 struct State : InputContextProperty {
   uint64_t id, epoch = 1, seq = 0, applied = 0, revision = 0;
   uint64_t cloudPollUntil = 0, lastCloudPoll = 0;
   std::string preedit;
+  size_t cursor = 0;
+  std::string displayPreedit;
+  size_t displayCursor = 0, editableBegin = 0;
+  std::vector<size_t> cursorStops;
+  char pendingPairKey = 0;
+  std::string pendingPairRight;
+  uint8_t symbolAutoState = 0;
+  bool doubleQuoteLeft = true, singleQuoteLeft = true;
   bool english = false, fullWidth = false, traditional = false,
-       englishPunctuation = false;
+       englishPunctuation = false, vMode = false;
   KeySym modifierCandidate = FcitxKey_None;
   TrackableObjectReference<InputContext> ic;
   State(uint64_t n, InputContext &context) : id(n), ic(context.watch()) {}
 };
+static void clearDisplayState(State *state) {
+  state->displayPreedit.clear();
+  state->displayCursor = 0;
+  state->editableBegin = 0;
+  state->cursorStops.clear();
+}
 class Word : public CandidateWord {
   WeType *engine_;
   unsigned index_;
@@ -179,6 +275,88 @@ class WeType : public InputMethodEngine {
                                 ".local/share";
     return directory / "fcitx5-wetypex/state";
   }
+  static char closingKey(char opening) {
+    switch (opening) {
+    case '(':
+      return ')';
+    case '[':
+      return ']';
+    case '{':
+      return '}';
+    case '<':
+      return '>';
+    case '\"':
+    case '\'':
+      return opening;
+    default:
+      return 0;
+    }
+  }
+  static bool nextSurroundingTextIs(InputContext *ic,
+                                    const std::string &expected) {
+    const auto &surrounding = ic->surroundingText();
+    if (!surrounding.isValid())
+      return false;
+    const auto &text = surrounding.text();
+    auto byte = utf8::ncharByteLength(text.begin(), surrounding.cursor());
+    return byte >= 0 && size_t(byte) <= text.size() &&
+           text.compare(size_t(byte), expected.size(), expected) == 0;
+  }
+  std::string mappedSymbol(State *s, char ascii, bool asciiMode) const {
+    const auto *entry = punctuationEntry(ascii);
+    if (!entry)
+      return std::string(1, ascii);
+    const bool useEnglish =
+        asciiMode || s->englishPunctuation || !chinesePunctuation_;
+    if (ascii == '/' && slashPunctuation_ && !useEnglish && !s->fullWidth)
+      return "、";
+    if (s->fullWidth)
+      return useEnglish ? entry->englishFull : entry->full;
+    if (useEnglish)
+      return entry->englishHalf;
+    return entry->normal;
+  }
+  bool commitSymbol(InputContext *ic, State *s, char ascii, bool asciiMode) {
+    const auto *entry = punctuationEntry(ascii);
+    if (!entry)
+      return false;
+    if (s->pendingPairKey == ascii && !s->pendingPairRight.empty() &&
+        nextSurroundingTextIs(ic, s->pendingPairRight)) {
+      ic->forwardKey(Key(FcitxKey_Right));
+      s->pendingPairKey = 0;
+      s->pendingPairRight.clear();
+      s->symbolAutoState = 0;
+      return true;
+    }
+    std::string mapped = mappedSymbol(s, ascii, asciiMode);
+    auto [left, right] = splitPair(mapped);
+    if (entry->pairType && !right.empty()) {
+      if (*config_.input->symbolAutoPair) {
+        ic->commitStringWithCursor(mapped, 1);
+        s->pendingPairKey = closingKey(ascii);
+        s->pendingPairRight = right;
+      } else if (entry->pairType == 2) {
+        bool &leftNext =
+            ascii == '\"' ? s->doubleQuoteLeft : s->singleQuoteLeft;
+        ic->commitString(leftNext ? left : right);
+        leftNext = !leftNext;
+      } else {
+        ic->commitString(left);
+      }
+    } else {
+      ic->commitString(mapped);
+    }
+    const bool autoChangeActive = symbolAutoChange_ && !asciiMode &&
+                                  !s->englishPunctuation &&
+                                  chinesePunctuation_ && !s->fullWidth;
+    if (autoChangeActive && s->symbolAutoState == 3 && ascii == ':')
+      s->symbolAutoState = 1;
+    else if (autoChangeActive && s->symbolAutoState == 3 && ascii == ',')
+      s->symbolAutoState = 2;
+    else
+      s->symbolAutoState = 0;
+    return true;
+  }
   void reloadSettings() {
     const char *config = getenv("XDG_CONFIG_HOME"), *home = getenv("HOME");
     std::string path =
@@ -236,9 +414,33 @@ class WeType : public InputMethodEngine {
     input->fuzzyRl.setValue(json_object_get_boolean(wire::get(j.get(), "fuzzy_rl")));
     input->fuzzyHf.setValue(json_object_get_boolean(wire::get(j.get(), "fuzzy_hf")));
     input->fuzzyGk.setValue(json_object_get_boolean(wire::get(j.get(), "fuzzy_gk")));
+    input->fuzzyAnAng.setValue(
+        json_object_get_boolean(wire::get(j.get(), "fuzzy_an_ang")));
+    input->fuzzyIanIang.setValue(
+        json_object_get_boolean(wire::get(j.get(), "fuzzy_ian_iang")));
+    input->fuzzyUanUang.setValue(
+        json_object_get_boolean(wire::get(j.get(), "fuzzy_uan_uang")));
     input->fuzzyCCh.setValue(json_object_get_boolean(wire::get(j.get(), "fuzzy_c_ch")));
     input->fuzzySSh.setValue(json_object_get_boolean(wire::get(j.get(), "fuzzy_s_sh")));
     input->fuzzyZZh.setValue(json_object_get_boolean(wire::get(j.get(), "fuzzy_z_zh")));
+    input->fuzzyHuiFei.setValue(
+        json_object_get_boolean(wire::get(j.get(), "fuzzy_hui_fei")));
+    input->fuzzyEnEng.setValue(
+        json_object_get_boolean(wire::get(j.get(), "fuzzy_en_eng")));
+    input->fuzzyInIng.setValue(
+        json_object_get_boolean(wire::get(j.get(), "fuzzy_in_ing")));
+    input->fuzzyOnOng.setValue(
+        json_object_get_boolean(wire::get(j.get(), "fuzzy_on_ong")));
+    input->fuzzyHuangWang.setValue(
+        json_object_get_boolean(wire::get(j.get(), "fuzzy_huang_wang")));
+    input->fuzzyUnOng.setValue(
+        json_object_get_boolean(wire::get(j.get(), "fuzzy_un_ong")));
+    input->fuzzyUnIong.setValue(
+        json_object_get_boolean(wire::get(j.get(), "fuzzy_un_iong")));
+    input->fuzzyAnAi.setValue(
+        json_object_get_boolean(wire::get(j.get(), "fuzzy_an_ai")));
+    input->fuzzyEngOng.setValue(
+        json_object_get_boolean(wire::get(j.get(), "fuzzy_eng_ong")));
     auto *phrases = config_.phrases.mutableValue();
     phrases->clipboard.setValue(clipboardEnabled_);
     auto *appearance = config_.appearance.mutableValue();
@@ -350,9 +552,21 @@ class WeType : public InputMethodEngine {
     wire::put(json.get(), "fuzzy_rl", bool(*input.fuzzyRl));
     wire::put(json.get(), "fuzzy_hf", bool(*input.fuzzyHf));
     wire::put(json.get(), "fuzzy_gk", bool(*input.fuzzyGk));
+    wire::put(json.get(), "fuzzy_an_ang", bool(*input.fuzzyAnAng));
+    wire::put(json.get(), "fuzzy_ian_iang", bool(*input.fuzzyIanIang));
+    wire::put(json.get(), "fuzzy_uan_uang", bool(*input.fuzzyUanUang));
     wire::put(json.get(), "fuzzy_c_ch", bool(*input.fuzzyCCh));
     wire::put(json.get(), "fuzzy_s_sh", bool(*input.fuzzySSh));
     wire::put(json.get(), "fuzzy_z_zh", bool(*input.fuzzyZZh));
+    wire::put(json.get(), "fuzzy_hui_fei", bool(*input.fuzzyHuiFei));
+    wire::put(json.get(), "fuzzy_en_eng", bool(*input.fuzzyEnEng));
+    wire::put(json.get(), "fuzzy_in_ing", bool(*input.fuzzyInIng));
+    wire::put(json.get(), "fuzzy_on_ong", bool(*input.fuzzyOnOng));
+    wire::put(json.get(), "fuzzy_huang_wang", bool(*input.fuzzyHuangWang));
+    wire::put(json.get(), "fuzzy_un_ong", bool(*input.fuzzyUnOng));
+    wire::put(json.get(), "fuzzy_un_iong", bool(*input.fuzzyUnIong));
+    wire::put(json.get(), "fuzzy_an_ai", bool(*input.fuzzyAnAi));
+    wire::put(json.get(), "fuzzy_eng_ong", bool(*input.fuzzyEngOng));
     const auto &appearance = *config_.appearance;
     wire::put(json.get(), "page_size", int64_t(*appearance.pageSize));
     wire::put(json.get(), "candidate_size",
@@ -568,6 +782,8 @@ class WeType : public InputMethodEngine {
     if (!s->preedit.empty()) {
       send(ic, "reset");
       s->preedit.clear();
+      s->cursor = 0;
+      clearDisplayState(s);
       ic->inputPanel().reset();
       panel(ic, s);
     }
@@ -607,11 +823,14 @@ class WeType : public InputMethodEngine {
   void panel(InputContext *ic, State *s) {
     ic->inputPanel().setAuxUp(Text());
     const std::string displayed =
-        *config_.input->mode == wetype_config::InputMode::Pinyin
+        !s->displayPreedit.empty() ? s->displayPreedit
+        : !s->vMode && *config_.input->mode == wetype_config::InputMode::Pinyin
             ? formatPinyinPreedit(s->preedit)
             : s->preedit;
     Text text(displayed);
-    text.setCursor(displayed.size());
+    text.setCursor(!s->displayPreedit.empty()
+                       ? std::min(s->displayCursor, displayed.size())
+                       : displayCursorForRaw(s->preedit, displayed, s->cursor));
     ic->inputPanel().setClientPreedit(text);
     // Windows 2.1.3.18 shows composition inline in the target application;
     // the candidate bar contains candidates only.
@@ -657,6 +876,8 @@ class WeType : public InputMethodEngine {
         ++s->epoch;
         s->seq = s->applied = 0;
         s->preedit.clear();
+        s->cursor = 0;
+        clearDisplayState(s);
         ic->inputPanel().setCandidateList(nullptr);
         panel(ic, s);
       }
@@ -759,7 +980,8 @@ class WeType : public InputMethodEngine {
       writer_->setEnabled(!outbound_.empty());
   }
   void send(InputContext *ic, const char *op, const std::string &key = "",
-            int index = 0, int64_t revision = -1) {
+            int index = 0, int64_t revision = -1, int64_t cursor = -1,
+            const std::string &mapped = {}, int pairCursor = -1) {
     auto *s = state(ic);
     if (child_ <= 0 && !start()) {
       failed_ = true;
@@ -775,6 +997,9 @@ class WeType : public InputMethodEngine {
     wire::put(json.get(), "key", key);
     wire::put(json.get(), "index", int64_t(index));
     wire::put(json.get(), "revision", revision);
+    wire::put(json.get(), "cursor", cursor);
+    wire::put(json.get(), "mapped", mapped);
+    wire::put(json.get(), "pair_cursor", int64_t(pairCursor));
     wire::put(json.get(), "before", op == std::string("predict") ? key : "");
     wire::put(json.get(), "chinese_punctuation", int64_t(chinesePunctuation_));
     wire::put(json.get(), "keyboard", int64_t(keyboard_));
@@ -784,16 +1009,31 @@ class WeType : public InputMethodEngine {
               int64_t(*inputConfig.mode == wetype_config::InputMode::DoublePinyin
                           ? doubleSchemes[int(*inputConfig.doublePinyin)]
                           : 0));
+    wire::put(json.get(), "wubi_solution", int64_t(*inputConfig.wubi));
     wire::put(json.get(), "smart_input", bool(*inputConfig.smartInput));
     wire::put(json.get(), "emoji_recommend",
               bool(*inputConfig.emojiRecommend));
+    wire::put(json.get(), "v_mode", bool(*config_.shortcuts->vMode));
     wire::put(json.get(), "fuzzy_nl", bool(*inputConfig.fuzzyNl));
     wire::put(json.get(), "fuzzy_rl", bool(*inputConfig.fuzzyRl));
     wire::put(json.get(), "fuzzy_hf", bool(*inputConfig.fuzzyHf));
     wire::put(json.get(), "fuzzy_gk", bool(*inputConfig.fuzzyGk));
+    wire::put(json.get(), "fuzzy_an_ang", bool(*inputConfig.fuzzyAnAng));
+    wire::put(json.get(), "fuzzy_ian_iang", bool(*inputConfig.fuzzyIanIang));
+    wire::put(json.get(), "fuzzy_uan_uang", bool(*inputConfig.fuzzyUanUang));
     wire::put(json.get(), "fuzzy_c_ch", bool(*inputConfig.fuzzyCCh));
     wire::put(json.get(), "fuzzy_s_sh", bool(*inputConfig.fuzzySSh));
     wire::put(json.get(), "fuzzy_z_zh", bool(*inputConfig.fuzzyZZh));
+    wire::put(json.get(), "fuzzy_hui_fei", bool(*inputConfig.fuzzyHuiFei));
+    wire::put(json.get(), "fuzzy_en_eng", bool(*inputConfig.fuzzyEnEng));
+    wire::put(json.get(), "fuzzy_in_ing", bool(*inputConfig.fuzzyInIng));
+    wire::put(json.get(), "fuzzy_on_ong", bool(*inputConfig.fuzzyOnOng));
+    wire::put(json.get(), "fuzzy_huang_wang",
+              bool(*inputConfig.fuzzyHuangWang));
+    wire::put(json.get(), "fuzzy_un_ong", bool(*inputConfig.fuzzyUnOng));
+    wire::put(json.get(), "fuzzy_un_iong", bool(*inputConfig.fuzzyUnIong));
+    wire::put(json.get(), "fuzzy_an_ai", bool(*inputConfig.fuzzyAnAi));
+    wire::put(json.get(), "fuzzy_eng_ong", bool(*inputConfig.fuzzyEngOng));
     wire::put(json.get(), "traditional", int64_t(s->traditional));
     outbound_ += wire::dump(json.get()) + '\n';
     if (outbound_.size() > 262144) {
@@ -846,9 +1086,38 @@ class WeType : public InputMethodEngine {
         if (json_object_is_type(v, json_type_string))
           ic->commitString(json_object_get_string(v));
       }
+    auto cursorCommit = wire::str(j.get(), "cursor_commit");
+    auto cursorCommitPosition =
+        wire::number(j.get(), "cursor_commit_position", -1);
+    if (!cursorCommit.empty() && cursorCommitPosition >= 0 &&
+        size_t(cursorCommitPosition) <= utf8::length(cursorCommit))
+      ic->commitStringWithCursor(cursorCommit, size_t(cursorCommitPosition));
     if (seq != s->seq)
       return;
     s->preedit = wire::str(j.get(), "preedit");
+    s->cursor =
+        std::min<size_t>(std::max<int64_t>(0, wire::number(j.get(), "cursor",
+                                                           s->preedit.size())),
+                         s->preedit.size());
+    s->editableBegin = std::min<size_t>(
+        std::max<int64_t>(0, wire::number(j.get(), "editable_begin")),
+        s->preedit.size());
+    s->displayPreedit = wire::str(j.get(), "display_preedit");
+    s->displayCursor = std::min<size_t>(
+        std::max<int64_t>(0, wire::number(j.get(), "display_cursor")),
+        s->displayPreedit.size());
+    s->cursorStops.clear();
+    auto *cursorStops = wire::get(j.get(), "cursor_stops");
+    if (cursorStops && json_object_is_type(cursorStops, json_type_array))
+      for (size_t i = 0; i < json_object_array_length(cursorStops); ++i) {
+        auto *value = json_object_array_get_idx(cursorStops, i);
+        if (json_object_is_type(value, json_type_int)) {
+          const auto stop = json_object_get_int64(value);
+          if (stop >= 0 && size_t(stop) <= s->preedit.size() &&
+              (s->cursorStops.empty() || size_t(stop) > s->cursorStops.back()))
+            s->cursorStops.push_back(size_t(stop));
+        }
+      }
     s->revision = wire::number(j.get(), "revision");
     auto list = std::make_unique<CommonCandidateList>();
     list->setPageSize(pageSize_);
@@ -970,7 +1239,7 @@ public:
     auto *current = state(ic);
     current->english = *config_.input->defaultLanguage ==
                        wetype_config::DefaultLanguage::English;
-    current->traditional = *config_.shortcuts->traditionalSwitch;
+    current->traditional = false;
     ic->statusArea().addAction(StatusGroup::InputMethod, &settingsAction_);
     if (ic->capabilityFlags().test(CapabilityFlag::Password) ||
         ic->capabilityFlags().test(CapabilityFlag::Sensitive))
@@ -982,6 +1251,12 @@ public:
     auto *s = state(ic);
     ++s->epoch;
     s->preedit.clear();
+    s->cursor = 0;
+    clearDisplayState(s);
+    s->pendingPairKey = 0;
+    s->pendingPairRight.clear();
+    s->symbolAutoState = 0;
+    s->vMode = false;
     s->cloudPollUntil = 0;
     ic->inputPanel().reset();
     if (child_ > 0)
@@ -996,9 +1271,16 @@ public:
       send(e.inputContext(), "close");
   }
   void select(InputContext *ic, unsigned index, int64_t revision = -1) {
+    auto *list = dynamic_cast<CommonCandidateList *>(
+        ic->inputPanel().candidateList().get());
+    if (!list || index >= unsigned(list->totalSize()))
+      return;
     send(ic, "select", "", index, revision);
     auto *s = state(ic);
+    s->vMode = false;
     s->preedit.clear();
+    s->cursor = 0;
+    clearDisplayState(s);
     ic->inputPanel().setCandidateList(nullptr);
     panel(ic, s);
   }
@@ -1034,14 +1316,22 @@ public:
         e.filterAndAccept();
         return;
       }
+      const bool configuredLanguageSwitch =
+          releasedConfiguredKey(*config_.shortcuts->languageSwitchKeys) &&
+          ((!shiftModifier && !ctrlModifier) ||
+           (shiftModifier && *config_.shortcuts->shiftSwitch) ||
+           (ctrlModifier && *config_.shortcuts->ctrlSwitch));
       if (s->modifierCandidate == sym &&
           ((shiftModifier && *config_.shortcuts->shiftSwitch) ||
            (ctrlModifier && *config_.shortcuts->ctrlSwitch) ||
-           releasedConfiguredKey(*config_.shortcuts->languageSwitchKeys))) {
+           configuredLanguageSwitch)) {
         if (!s->preedit.empty())
           send(ic, "reset");
         s->preedit.clear();
+        s->cursor = 0;
+        clearDisplayState(s);
         s->english = !s->english;
+        s->symbolAutoState = 0;
         s->modifierCandidate = FcitxKey_None;
         ic->inputPanel().reset();
         panel(ic, s);
@@ -1077,6 +1367,7 @@ public:
     if (*config_.shortcuts->punctuationSwitch &&
         key.checkKeyList(*config_.shortcuts->punctuationSwitchKeys)) {
       s->englishPunctuation = !s->englishPunctuation;
+      s->symbolAutoState = 0;
       e.filterAndAccept();
       return;
     }
@@ -1093,6 +1384,7 @@ public:
     if (*config_.shortcuts->halfFull &&
         key.checkKeyList(*config_.shortcuts->halfFullKeys)) {
       s->fullWidth = !s->fullWidth;
+      s->symbolAutoState = 0;
       e.filterAndAccept();
       return;
     }
@@ -1102,7 +1394,7 @@ public:
     if (ic->capabilityFlags().test(CapabilityFlag::Password) ||
         ic->capabilityFlags().test(CapabilityFlag::Sensitive))
       return;
-    if (s->preedit.empty() && *config_.shortcuts->aiAssistant &&
+    if (!s->vMode && s->preedit.empty() && *config_.shortcuts->aiAssistant &&
         key.checkKeyList(*config_.shortcuts->aiAssistantKeys)) {
       const auto &surrounding = ic->surroundingText();
       if (surrounding.isValid() && surrounding.cursor()) {
@@ -1130,10 +1422,18 @@ public:
       }
     }
     if (s->english) {
-      if (s->fullWidth && sym >= 0x20 && sym <= 0x7e) {
-        uint32_t full = sym == FcitxKey_space ? 0x3000 : sym + 0xfee0;
-        ic->commitString(utf8::UCS4ToUTF8(full));
-        e.filterAndAccept();
+      if (sym >= 0x20 && sym <= 0x7e) {
+        const char ascii = char(sym);
+        const auto *entry = punctuationEntry(ascii);
+        if (entry &&
+            (s->fullWidth || entry->pairType || s->pendingPairKey == ascii)) {
+          commitSymbol(ic, s, ascii, true);
+          e.filterAndAccept();
+        } else if (s->fullWidth) {
+          uint32_t full = sym == FcitxKey_space ? 0x3000 : sym + 0xfee0;
+          ic->commitString(utf8::UCS4ToUTF8(full));
+          e.filterAndAccept();
+        }
       }
       return;
     }
@@ -1144,6 +1444,8 @@ public:
       if (composing && sym == FcitxKey_Return) {
         ic->commitString(s->preedit);
         s->preedit.clear();
+        s->cursor = 0;
+        clearDisplayState(s);
         ic->inputPanel().reset();
         panel(ic, s);
         e.filterAndAccept();
@@ -1152,15 +1454,99 @@ public:
     }
     auto *list = dynamic_cast<CommonCandidateList *>(
         ic->inputPanel().candidateList().get());
-    bool pageDown = sym == FcitxKey_Page_Down ||
-                    key.checkKeyList(*config_.shortcuts->nextPageKeys) ||
-                    (*config_.shortcuts->pageMinusEqual &&
-                     sym == FcitxKey_equal) ||
-                    (*config_.shortcuts->pageBrackets &&
-                     sym == FcitxKey_bracketright) ||
-                    (*config_.shortcuts->pageCommaPeriod &&
-                     sym == FcitxKey_period) ||
-                    (*config_.shortcuts->pageShiftTab && sym == FcitxKey_Tab);
+    if (!composing && !s->vMode && *config_.shortcuts->vMode &&
+        key.checkKeyList(*config_.shortcuts->vModeKeys)) {
+      // VModeV2 is armed by the core's pending-input callback for a literal
+      // "v", then activated through SessionOptions 0x11.
+      send(ic, "key", "v");
+      send(ic, "vmode");
+      s->vMode = true;
+      s->preedit.clear();
+      s->cursor = 0;
+      clearDisplayState(s);
+      ic->inputPanel().setCandidateList(nullptr);
+      panel(ic, s);
+      e.filterAndAccept();
+      return;
+    }
+    if (s->vMode && !composing && sym == FcitxKey_Escape) {
+      send(ic, "reset");
+      s->vMode = false;
+      e.filterAndAccept();
+      return;
+    }
+    if (s->vMode && sym >= 0x20 && sym <= 0x7e) {
+      if (sym == FcitxKey_space) {
+        if (list && list->totalSize())
+          select(ic, list->globalCursorIndex() >= 0
+                         ? unsigned(list->globalCursorIndex())
+                         : 0);
+        e.filterAndAccept();
+        return;
+      }
+      std::string text(1, char(sym));
+      s->cursor = std::min(s->cursor, s->preedit.size());
+      s->preedit.insert(s->cursor, text);
+      ++s->cursor;
+      clearDisplayState(s);
+      send(ic, "key", text);
+      panel(ic, s);
+      e.filterAndAccept();
+      return;
+    }
+    if (composing && (sym == FcitxKey_Left || sym == FcitxKey_Right ||
+                      sym == FcitxKey_Home || sym == FcitxKey_End)) {
+      size_t target = s->cursor;
+      if (sym == FcitxKey_Home) {
+        target = s->editableBegin;
+      } else if (sym == FcitxKey_End) {
+        target = s->preedit.size();
+      } else if (sym == FcitxKey_Left && target) {
+        size_t previous = s->editableBegin;
+        for (const auto stop : s->cursorStops) {
+          if (stop >= target)
+            break;
+          if (stop >= s->editableBegin)
+            previous = stop;
+        }
+        if (s->cursorStops.empty() && target > s->editableBegin) {
+          previous = target - 1;
+          while (previous > s->editableBegin &&
+                 (static_cast<unsigned char>(s->preedit[previous]) & 0xc0) ==
+                     0x80)
+            --previous;
+        }
+        target = previous;
+      } else if (sym == FcitxKey_Right && target < s->preedit.size()) {
+        target += firstUtf8Size(std::string_view(s->preedit).substr(target));
+      }
+      target = std::min(target, s->preedit.size());
+      if (target != s->cursor) {
+        s->cursor = target;
+        clearDisplayState(s);
+        send(ic, "move", "", 0, -1, target);
+        panel(ic, s);
+      }
+      e.filterAndAccept();
+      return;
+    }
+    if (composing && list && (sym == FcitxKey_Up || sym == FcitxKey_Down)) {
+      if (sym == FcitxKey_Up)
+        list->prevCandidate();
+      else
+        list->nextCandidate();
+      ic->updateUserInterface(UserInterfaceComponent::InputPanel);
+      e.filterAndAccept();
+      return;
+    }
+    bool pageDown =
+        sym == FcitxKey_Page_Down ||
+        key.checkKeyList(*config_.shortcuts->nextPageKeys) ||
+        (*config_.shortcuts->pageMinusEqual && sym == FcitxKey_equal) ||
+        (*config_.shortcuts->pageBrackets && sym == FcitxKey_bracketright) ||
+        (*config_.shortcuts->pageCommaPeriod && sym == FcitxKey_period) ||
+        (*config_.shortcuts->pageShiftTab &&
+         !key.states().test(KeyState::Shift) && sym == FcitxKey_Tab);
     bool pageUp = sym == FcitxKey_Page_Up ||
                   key.checkKeyList(*config_.shortcuts->previousPageKeys) ||
                   (*config_.shortcuts->pageMinusEqual &&
@@ -1195,80 +1581,158 @@ public:
       e.filterAndAccept();
       return;
     }
-    if (composing && (sym == FcitxKey_space ||
-                      (sym >= FcitxKey_1 && sym < FcitxKey_1 + pageSize_))) {
-      unsigned index = (list ? list->currentPage() * pageSize_ : 0) +
-                       (sym == FcitxKey_space ? 0 : sym - FcitxKey_1);
+    if (composing && !s->vMode &&
+        (sym == FcitxKey_space || (sym >= FcitxKey_1 && sym <= FcitxKey_9))) {
+      const unsigned pageIndex =
+          sym == FcitxKey_space ? 0 : unsigned(sym - FcitxKey_1);
+      if (!list || pageIndex >= unsigned(list->size())) {
+        if (sym != FcitxKey_space)
+          return;
+      }
+      unsigned index =
+          sym == FcitxKey_space && list && list->globalCursorIndex() >= 0
+              ? unsigned(list->globalCursorIndex())
+              : unsigned((list ? list->currentPage() * pageSize_ : 0) +
+                         pageIndex);
       select(ic, index);
       e.filterAndAccept();
       return;
     }
     if (composing && sym == FcitxKey_BackSpace) {
-      if (!s->preedit.empty()) {
-        size_t pos = s->preedit.size() - 1;
+      s->cursor = std::min(s->cursor, s->preedit.size());
+      if (s->cursor) {
+        size_t pos = s->cursor - 1;
         while (pos &&
                (static_cast<unsigned char>(s->preedit[pos]) & 0xc0) == 0x80)
           --pos;
-        s->preedit.erase(pos);
+        s->preedit.erase(pos, s->cursor - pos);
+        s->cursor = pos;
+        clearDisplayState(s);
       }
       send(ic, "backspace");
       panel(ic, s);
       e.filterAndAccept();
       return;
     }
+    if (composing && sym == FcitxKey_Delete) {
+      s->cursor = std::min(s->cursor, s->preedit.size());
+      if (s->cursor < s->preedit.size()) {
+        const auto count =
+            firstUtf8Size(std::string_view(s->preedit).substr(s->cursor));
+        s->preedit.erase(s->cursor, count);
+        clearDisplayState(s);
+        send(ic, "delete");
+        panel(ic, s);
+      }
+      e.filterAndAccept();
+      return;
+    }
     if (composing && (sym == FcitxKey_Escape || sym == FcitxKey_Return ||
                       sym == FcitxKey_KP_Enter)) {
+      if (s->vMode && sym != FcitxKey_Escape && list && list->totalSize()) {
+        select(ic, list->globalCursorIndex() >= 0
+                       ? unsigned(list->globalCursorIndex())
+                       : 0);
+        e.filterAndAccept();
+        return;
+      }
       send(ic, sym == FcitxKey_Escape ? "reset" : "raw");
+      s->vMode = false;
       s->preedit.clear();
+      s->cursor = 0;
+      clearDisplayState(s);
       ic->inputPanel().setCandidateList(nullptr);
       panel(ic, s);
       e.filterAndAccept();
       return;
     }
-    bool letter = (sym >= FcitxKey_a && sym <= FcitxKey_z) ||
-                  (sym >= FcitxKey_A && sym <= FcitxKey_Z);
-    bool punctuation = sym == FcitxKey_comma || sym == FcitxKey_period ||
-                       sym == FcitxKey_semicolon || sym == FcitxKey_colon ||
-                       sym == FcitxKey_question || sym == FcitxKey_exclam ||
-                       sym == FcitxKey_apostrophe ||
-                       (sym == FcitxKey_slash && slashPunctuation_);
-    if (!composing && *config_.input->symbolAutoPair) {
-      const char *pair = nullptr;
-      if (sym == FcitxKey_parenleft)
-        pair = chinesePunctuation_ ? "（）" : "()";
-      else if (sym == FcitxKey_braceleft)
-        pair = chinesePunctuation_ ? "｛｝" : "{}";
-      else if (sym == FcitxKey_bracketleft)
-        pair = chinesePunctuation_ ? "【】" : "[]";
-      if (pair) {
-        ic->commitStringWithCursor(pair, 1);
+    const bool lower = sym >= FcitxKey_a && sym <= FcitxKey_z;
+    const bool upper = sym >= FcitxKey_A && sym <= FcitxKey_Z;
+    const bool digit = sym >= FcitxKey_0 && sym <= FcitxKey_9;
+    const bool ascii = sym >= 0x20 && sym <= 0x7e;
+    const char asciiChar = ascii ? char(sym) : 0;
+    const auto *entry = ascii ? punctuationEntry(asciiChar) : nullptr;
+
+    // SymbolAutoChangedHelper in the desktop implementation delays numeric
+    // punctuation correction.  A colon/comma after a digit is displayed in
+    // Chinese form first; only another digit changes it back to ASCII.
+    const bool autoChangeActive = symbolAutoChange_ && !composing &&
+                                  !s->englishPunctuation &&
+                                  chinesePunctuation_ && !s->fullWidth;
+    if (!composing && digit && autoChangeActive) {
+      if (s->symbolAutoState == 1 || s->symbolAutoState == 2) {
+        const char replacement = s->symbolAutoState == 1 ? ':' : ',';
+        ic->deleteSurroundingText(-1, 1);
+        ic->commitString(std::string(1, replacement) + asciiChar);
+        s->symbolAutoState = 3;
         e.filterAndAccept();
         return;
       }
+      s->symbolAutoState = 3;
+    } else if (!composing && (!entry || !autoChangeActive)) {
+      s->symbolAutoState = 0;
     }
-    if (!composing && symbolAutoChange_ && sym == FcitxKey_colon) {
-      const auto &surrounding = ic->surroundingText();
-      if (surrounding.isValid() && surrounding.cursor()) {
-        const auto &text = surrounding.text();
-        auto bytes = utf8::ncharByteLength(text.begin(), surrounding.cursor());
-        if (bytes > 0 && size_t(bytes) <= text.size() &&
-            text[size_t(bytes) - 1] >= '0' && text[size_t(bytes) - 1] <= '9') {
-          ic->commitString(":");
-          e.filterAndAccept();
-          return;
+
+    // The original desktop treats apostrophe as a pinyin separator while a
+    // composition exists. Outside a composition it follows the quote-pair
+    // entry in punctuation.json.
+    const bool separator = composing && sym == FcitxKey_apostrophe;
+    if (!composing && s->fullWidth &&
+        (upper || digit || sym == FcitxKey_space)) {
+      const uint32_t full = sym == FcitxKey_space ? 0x3000 : sym + 0xfee0;
+      ic->commitString(utf8::UCS4ToUTF8(full));
+      e.filterAndAccept();
+      return;
+    }
+    if (!composing && upper) {
+      ic->commitString(std::string(1, asciiChar));
+      e.filterAndAccept();
+      return;
+    }
+    if (!composing && entry) {
+      if (commitSymbol(ic, s, asciiChar, false))
+        e.filterAndAccept();
+      return;
+    }
+    if (composing && entry && !separator) {
+      std::string mapped = mappedSymbol(s, asciiChar, false);
+      int pairCursor = -1;
+      auto [left, right] = splitPair(mapped);
+      if (entry->pairType && !right.empty()) {
+        if (*config_.input->symbolAutoPair) {
+          pairCursor = 1;
+          s->pendingPairKey = closingKey(asciiChar);
+          s->pendingPairRight = right;
+        } else if (entry->pairType == 2) {
+          bool &leftNext =
+              asciiChar == '"' ? s->doubleQuoteLeft : s->singleQuoteLeft;
+          mapped = leftNext ? left : right;
+          leftNext = !leftNext;
+        } else {
+          mapped = left;
         }
       }
+      send(ic, "punctuation", std::string(1, asciiChar), 0, -1, -1, mapped,
+           pairCursor);
+      e.filterAndAccept();
+      return;
     }
-    if (letter || punctuation) {
-      std::string text(1, char(sym));
-      s->preedit += text;
-      if (letter && networkEnabled_)
+    if (composing && upper) {
+      send(ic, "punctuation", std::string(1, asciiChar), 0, -1, -1,
+           std::string(1, asciiChar));
+      e.filterAndAccept();
+      return;
+    }
+    if (lower || separator) {
+      s->symbolAutoState = 0;
+      std::string text(1, asciiChar);
+      s->cursor = std::min(s->cursor, s->preedit.size());
+      s->preedit.insert(s->cursor, text);
+      ++s->cursor;
+      clearDisplayState(s);
+      if (lower && networkEnabled_)
         s->cloudPollUntil = now(CLOCK_MONOTONIC) + 1500000;
-      bool oldPunctuation = chinesePunctuation_;
-      if (s->englishPunctuation)
-        chinesePunctuation_ = false;
-      send(ic, punctuation ? "punctuation" : "key", text);
-      chinesePunctuation_ = oldPunctuation;
+      send(ic, "key", text);
       panel(ic, s);
       e.filterAndAccept();
     }

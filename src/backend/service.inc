@@ -44,11 +44,31 @@ struct ServiceSession {
   uint64_t engine = 0, revision = 0;
   uint32_t keyboard = 0;
   std::string preedit, selected;
+  size_t cursor = 0;
+  std::string pendingRaw, displayPreedit;
+  size_t displayCursor = 0;
+  std::vector<size_t> cursorStops;
   unsigned pending = 0;
   std::mutex mutex;
   std::vector<ServiceCandidate> candidates;
   std::vector<std::string> commits;
 };
+static void append_pending_scalar(std::string &output, unsigned char value) {
+  if (value)
+    output.push_back(char(value));
+}
+static void append_utf8_stops(std::vector<size_t> &stops,
+                              const std::string &text, size_t begin) {
+  size_t offset = 0;
+  while (offset < text.size()) {
+    const auto first = static_cast<unsigned char>(text[offset]);
+    size_t length = first < 0x80 ? 1 : first < 0xe0 ? 2 : first < 0xf0 ? 3 : 4;
+    if (offset + length > text.size())
+      break;
+    offset += length;
+    stops.push_back(begin + offset);
+  }
+}
 static void configure_cloud_session(unsigned char *config) {
   // Windows 2.1.3.18 desktop defaults recovered from wetype_server.exe's
   // SessionConfigRW fallback object and its field serializer.  In particular,
@@ -116,10 +136,60 @@ static void service_listener(uint64_t, int32_t *types, void **payloads,
         s.commits.emplace_back(text, n);
         s.selected.clear();
       }
-    } else if (types[i] == 4) {
-      s.pending = *(uint32_t *)((char *)payloads[i] + 8);
-      if (s.pending > 4096)
+    } else if (types[i] == 5) {
+      // CCallbackHolder::sigPendingInputUpdated emits event 5.  Its payload is
+      // the head pointer of PendingInput's singly-linked list; each node keeps
+      // the next pointer at +8.  Count it while the callback owns the list.
+      void *node = payloads[i];
+      unsigned pending = 0;
+      std::string raw, display;
+      std::vector<size_t> stops{0};
+      size_t displayCursor = 0;
+      bool hasCursor = false;
+      while (node && pending < 4096) {
+        ++pending;
+        const auto type = *(uint32_t *)node;
+        if (type <= 1) {
+          const auto length = *(uint32_t *)((char *)node + 24);
+          const auto data = *(const char **)((char *)node + 32);
+          if (length > 65536 || (!data && length))
+            _exit(89);
+          std::string value(data ? data : "", length);
+          const auto begin = raw.size();
+          raw += value;
+          display += value;
+          // PendingInputSelectedText (type 0) contributes a stop for each
+          // selected character. ExactlyMatched text is divided by explicit
+          // Separator nodes instead.
+          if (type == 0)
+            append_utf8_stops(stops, value, begin);
+        } else if (type == 2 || type == 4 || type == 5) {
+          // Deletion/replacement/exchange records retain the user's original
+          // byte at +24 for display; their synthetic correction is not shown.
+          const auto value = *(unsigned char *)((char *)node + 24);
+          append_pending_scalar(raw, value);
+          append_pending_scalar(display, value);
+        } else if (type == 6) {
+          // Every separator is visible. Only a separator whose stored byte is
+          // an apostrophe was explicitly typed and therefore belongs to raw.
+          if (stops.empty() || stops.back() != raw.size())
+            stops.push_back(raw.size());
+          display.push_back('\'');
+          if (*(unsigned char *)((char *)node + 24) == '\'')
+            raw.push_back('\'');
+        } else if (type == 7) {
+          displayCursor = display.size();
+          hasCursor = true;
+        }
+        node = *(void **)((char *)node + 8);
+      }
+      if (node)
         _exit(89);
+      s.pending = pending;
+      s.pendingRaw = std::move(raw);
+      s.displayPreedit = std::move(display);
+      s.displayCursor = hasCursor ? displayCursor : s.displayPreedit.size();
+      s.cursorStops = std::move(stops);
     }
   }
 }
@@ -141,11 +211,17 @@ static void service_select(ServiceSession &s, unsigned rank) {
     std::lock_guard<std::mutex> lock(s.mutex);
     if (c.cover <= s.preedit.size())
       s.preedit.erase(0, c.cover);
+    s.cursor = s.preedit.size();
     if (s.pending && s.commits.empty())
       s.selected += c.text;
     if (!s.pending) {
       s.preedit.clear();
       s.selected.clear();
+      s.cursor = 0;
+      s.pendingRaw.clear();
+      s.displayPreedit.clear();
+      s.displayCursor = 0;
+      s.cursorStops.clear();
     }
   }
 }
@@ -232,19 +308,37 @@ static void service_loop() {
         uint32_t doublePin = std::clamp<int>(
             wire::number(request.get(), "double_scheme", 0), 0, 7);
         memcpy(config + 0x20, &doublePin, sizeof(doublePin));
+        // SessionCreator copies config[0x24..0x2a] into
+        // WubiSessionV2::InitArgs. The first four bytes are the WubiSolution
+        // enum (86/98/New Century).
+        uint32_t wubiSolution = std::clamp<int>(
+            wire::number(request.get(), "wubi_solution", 0), 0, 2);
+        memcpy(config + 0x24, &wubiSolution, sizeof(wubiSolution));
         if (wire::number(request.get(), "smart_input", 1)) {
           // InputAugmenter: transpose, neighbouring-key, insertion and skip
           // correction. Offsets are recovered from the original JNI bridge.
-          for (unsigned offset : {0x8u, 0x9u, 0xau, 0xbu})
+          for (unsigned offset : {0x8u, 0x9u, 0xau, 0xbu, 0xcu})
             config[offset] = 1;
         }
         config[0x0d] = wire::number(request.get(), "fuzzy_nl", 0);
         config[0x0e] = wire::number(request.get(), "fuzzy_rl", 0);
         config[0x0f] = wire::number(request.get(), "fuzzy_hf", 0);
         config[0x10] = wire::number(request.get(), "fuzzy_gk", 0);
+        config[0x11] = wire::number(request.get(), "fuzzy_an_ang", 0);
+        config[0x12] = wire::number(request.get(), "fuzzy_ian_iang", 0);
+        config[0x13] = wire::number(request.get(), "fuzzy_uan_uang", 0);
         config[0x14] = wire::number(request.get(), "fuzzy_c_ch", 0);
         config[0x15] = wire::number(request.get(), "fuzzy_s_sh", 0);
         config[0x16] = wire::number(request.get(), "fuzzy_z_zh", 0);
+        config[0x17] = wire::number(request.get(), "fuzzy_hui_fei", 0);
+        config[0x18] = wire::number(request.get(), "fuzzy_en_eng", 0);
+        config[0x19] = wire::number(request.get(), "fuzzy_in_ing", 0);
+        config[0x1a] = wire::number(request.get(), "fuzzy_on_ong", 0);
+        config[0x1b] = wire::number(request.get(), "fuzzy_huang_wang", 0);
+        config[0x1c] = wire::number(request.get(), "fuzzy_un_ong", 0);
+        config[0x1d] = wire::number(request.get(), "fuzzy_un_iong", 0);
+        config[0x1e] = wire::number(request.get(), "fuzzy_an_ai", 0);
+        config[0x1f] = wire::number(request.get(), "fuzzy_eng_ong", 0);
         if (wire::number(request.get(), "emoji_recommend", 1)) {
           config[0x33] = 1; // WeChat emoji
           config[0x34] = 1; // normal emoji
@@ -252,6 +346,9 @@ static void service_loop() {
           config[0x36] = 1; // emoji plus
           config[0x39] = 1; // symbol emoji
         }
+        // SessionCreator gates construction of VModeV2 on config +0x125.
+        // The UI later activates that wrapper with session bool option 0x11.
+        config[0x125] = wire::number(request.get(), "v_mode", 1);
         *(uint32_t *)(config + 0xb8) =
             wire::number(request.get(), "traditional", 0) ? 1 : 0;
         state->keyboard = keyboard;
@@ -265,6 +362,8 @@ static void service_loop() {
         sessions[client] = std::move(state);
       }
       auto &s = *sessions.at(client);
+      std::string cursorCommit;
+      int64_t cursorCommitPosition = -1;
       if (op == "predict") {
         auto before = wire::str(request.get(), "before");
         if (before.size() > 4096 || s.pending)
@@ -279,6 +378,21 @@ static void service_loop() {
           ((void (*)(uint64_t))syms.at("_wxime_get_most_likely_sequel"))(
               s.engine);
         }
+      } else if (op == "vmode") {
+        const bool enabled = wire::number(request.get(), "enabled", 1);
+        ((void (*)(uint64_t, uint32_t, bool))syms.at(
+            "_wxime_session_set_bool_option"))(s.engine, 0x11, enabled);
+        if (!enabled)
+          ((void (*)(uint64_t))syms.at("_wxime_reset_session"))(s.engine);
+        s.pending = 0;
+        s.preedit.clear();
+        s.selected.clear();
+        s.cursor = 0;
+        s.pendingRaw.clear();
+        s.displayPreedit.clear();
+        s.displayCursor = 0;
+        s.cursorStops.clear();
+        s.candidates.clear();
       } else if (op == "key") {
         auto key = wire::str(request.get(), "key");
         if (key.size() != 1 || (unsigned char)key[0] < 32 ||
@@ -287,7 +401,9 @@ static void service_loop() {
         if (s.preedit.size() >= 128 || s.selected.size() >= 384)
           wire::put(response.get(), "error", std::string("composition limit"));
         else {
-          s.preedit += key;
+          s.cursor = std::min(s.cursor, s.preedit.size());
+          s.preedit.insert(s.cursor, key);
+          s.cursor += key.size();
           ((void (*)(uint64_t, const char *, uint32_t, const void *,
                      uint32_t))syms.at("_wxime_process_input"))(
               s.engine, key.data(), 1, nullptr, 0);
@@ -298,7 +414,14 @@ static void service_loop() {
             {"?", "？"}, {"!", "！"}, {"'", "'"}, {"/", "、"}};
         auto key = wire::str(request.get(), "key");
         auto it = map.find(key);
-        if (it == map.end())
+        if (key.size() != 1 || (unsigned char)key[0] < 0x20 ||
+            (unsigned char)key[0] > 0x7e)
+          _exit(90);
+        auto mapped = wire::str(request.get(), "mapped");
+        if (mapped.size() > 32 || mapped.find('\0') != std::string::npos)
+          _exit(90);
+        auto pairCursor = wire::number(request.get(), "pair_cursor", -1);
+        if (pairCursor < -1 || pairCursor > 32)
           _exit(90);
         if (!s.preedit.empty() || !s.selected.empty())
           service_select(s, 0);
@@ -309,20 +432,58 @@ static void service_loop() {
           s.commits.push_back(raw);
           s.preedit.clear();
           s.selected.clear();
+          s.cursor = 0;
+          s.pendingRaw.clear();
+          s.displayPreedit.clear();
+          s.displayCursor = 0;
+          s.cursorStops.clear();
           s.pending = 0;
           s.candidates.clear();
         }
-        {
+        if (pairCursor >= 0 && !mapped.empty()) {
+          cursorCommit = mapped;
+          cursorCommitPosition = pairCursor;
+        } else {
           std::lock_guard<std::mutex> lock(s.mutex);
           s.commits.push_back(
-              wire::number(request.get(), "chinese_punctuation", 1) ? it->second
-                                                                    : key);
+              !mapped.empty()
+                  ? mapped
+                  : (it != map.end() && wire::number(request.get(),
+                                                     "chinese_punctuation", 1)
+                         ? it->second
+                         : key));
         }
       } else if (op == "backspace") {
-        if (!s.preedit.empty())
-          s.preedit.pop_back();
-        ((void (*)(uint64_t, uint8_t, const void *, uint32_t))syms.at(
-            "_wxime_drop_last"))(s.engine, 1, nullptr, 0);
+        if (s.cursor && !s.preedit.empty()) {
+          s.cursor = std::min(s.cursor, s.preedit.size());
+          s.preedit.erase(--s.cursor, 1);
+          ((void (*)(uint64_t, uint8_t, const void *, uint32_t))syms.at(
+              "_wxime_drop_last"))(s.engine, 1, nullptr, 0);
+        }
+      } else if (op == "move") {
+        auto position = wire::number(request.get(), "cursor", -1);
+        if (position < int64_t(s.selected.size()) ||
+            size_t(position) > s.selected.size() + s.preedit.size())
+          wire::put(response.get(), "error", std::string("invalid cursor"));
+        else {
+          s.cursor = size_t(position) - s.selected.size();
+          ((void (*)(uint64_t, uint32_t))syms.at(
+              "_wxime_reset_internal_cursor"))(
+              s.engine, uint32_t(s.preedit.size() - s.cursor));
+        }
+      } else if (op == "delete") {
+        s.cursor = std::min(s.cursor, s.preedit.size());
+        if (s.cursor < s.preedit.size()) {
+          ((void (*)(uint64_t, uint32_t))syms.at(
+              "_wxime_reset_internal_cursor"))(
+              s.engine, uint32_t(s.preedit.size() - s.cursor - 1));
+          ((void (*)(uint64_t, uint8_t, const void *, uint32_t))syms.at(
+              "_wxime_drop_last"))(s.engine, 1, nullptr, 0);
+          s.preedit.erase(s.cursor, 1);
+          ((void (*)(uint64_t, uint32_t))syms.at(
+              "_wxime_reset_internal_cursor"))(
+              s.engine, uint32_t(s.preedit.size() - s.cursor));
+        }
       } else if (op == "select") {
         auto expected = wire::number(request.get(), "revision", -1);
         if (expected >= 0 && (uint64_t)expected != s.revision)
@@ -336,6 +497,11 @@ static void service_loop() {
         s.pending = 0;
         s.preedit.clear();
         s.selected.clear();
+        s.cursor = 0;
+        s.pendingRaw.clear();
+        s.displayPreedit.clear();
+        s.displayCursor = 0;
+        s.cursorStops.clear();
         s.candidates.clear();
         if (op == "raw" && !raw.empty())
           s.commits.push_back(raw);
@@ -348,10 +514,26 @@ static void service_loop() {
         if (!s.pending && (!s.keyboard || !s.commits.empty())) {
           s.preedit.clear();
           s.selected.clear();
+          s.cursor = 0;
+          s.pendingRaw.clear();
+          s.displayPreedit.clear();
+          s.displayCursor = 0;
+          s.cursorStops.clear();
         }
         s.revision = seq;
         wire::put(response.get(), "revision", seq);
         wire::put(response.get(), "preedit", s.selected + s.preedit);
+        wire::put(response.get(), "cursor",
+                  int64_t(s.selected.size() + s.cursor));
+        wire::put(response.get(), "editable_begin", int64_t(s.selected.size()));
+        if (s.pendingRaw == s.selected + s.preedit) {
+          wire::put(response.get(), "display_preedit", s.displayPreedit);
+          wire::put(response.get(), "display_cursor", int64_t(s.displayCursor));
+          auto *stops = json_object_new_array();
+          for (auto stop : s.cursorStops)
+            json_object_array_add(stops, json_object_new_int64(stop));
+          json_object_object_add(response.get(), "cursor_stops", stops);
+        }
         auto *array = json_object_new_array();
         for (auto &c : s.candidates)
           json_object_array_add(
@@ -362,6 +544,11 @@ static void service_loop() {
           json_object_array_add(array,
                                 json_object_new_string_len(c.data(), c.size()));
         json_object_object_add(response.get(), "commits", array);
+        if (!cursorCommit.empty()) {
+          wire::put(response.get(), "cursor_commit", cursorCommit);
+          wire::put(response.get(), "cursor_commit_position",
+                    cursorCommitPosition);
+        }
         s.commits.clear();
       }
     }
