@@ -36,11 +36,14 @@ fi
 
 (
     cd "$output"
-    find . ./arch ./debian ./fedora -maxdepth 1 -type f \
+    while IFS= read -r -d '' file; do
+        digest=$(sha256sum "$file" | cut -d' ' -f1)
+        printf '%s  %s\n' "$digest" "$(basename "$file")"
+    done < <(find . ./arch ./debian ./fedora -maxdepth 1 -type f \
         \( -name 'fcitx5-wetypex-*.tar.gz' -o \
            -name 'fcitx5-wetypex-*.tar.zst' -o \
            -name 'fcitx5-wetypex-*.rpm' -o \
            -name 'fcitx5-wetypex_*.deb' -o \
            -name 'fcitx5-wetypex-*.pkg.tar.zst' \) \
-        -print0 | sort -z | xargs -0 sha256sum >SHA256SUMS
-)
+        -print0 | sort -z)
+) >"$output/SHA256SUMS"
