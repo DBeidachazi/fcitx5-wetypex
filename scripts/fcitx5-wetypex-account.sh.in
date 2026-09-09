@@ -28,7 +28,10 @@ case "$command_name" in
     ;;
   group-info)
     operation_name=WETYPE_GROUP_INFO
-    operation_value=1
+    operation_value="${2:-0}"
+    case "$operation_value" in
+      *[!0-9]*|'') echo "group-info current clipboard version must be an integer" >&2; exit 64 ;;
+    esac
     ;;
   set-functions)
     operation_name=WETYPE_SET_FUNCTIONS
@@ -109,7 +112,7 @@ case "$command_name" in
     case "$operation_value" in *[!0-9]*|'') echo "unbind requires a device UIN" >&2; exit 64 ;; esac
     ;;
   *)
-    echo "usage: fcitx5-wetypex-account pairing-code | pairing-status CODE | confirm-bind BIND_ID | group-info | set-functions GROUP_ID MASK | send-clipboard GROUP_ID TEXT | send-image GROUP_ID PNG_FILE | voice-file OPUS_FILE | p2p-code [TRANSFER_INFO_JSON] | p2p-peer CODE | p2p-init UIN [TRANSFER_INFO_JSON] | unbind UIN" >&2
+    echo "usage: fcitx5-wetypex-account pairing-code | pairing-status CODE | confirm-bind BIND_ID | group-info [CURRENT_CLIPBOARD_VERSION] | set-functions GROUP_ID MASK | send-clipboard GROUP_ID TEXT | send-image GROUP_ID PNG_FILE | voice-file OPUS_FILE | p2p-code [TRANSFER_INFO_JSON] | p2p-peer CODE | p2p-init UIN [TRANSFER_INFO_JSON] | unbind UIN" >&2
     exit 64
     ;;
 esac
@@ -218,6 +221,9 @@ elif command == "group-info":
               "clipboard_version": data.get("clipboard_version", 0),
               "clipboard_type": data.get("clipboard_type", 0),
               "clipboard_binary": data.get("clipboard_binary", ""),
+              "clipboard_expire_at": data.get("clipboard_expire_at", 0),
+              "clipboard_expiration": data.get("clipboard_expiration", 0),
+              "clipboard_from_uin": data.get("clipboard_from_uin", 0),
               "hotword_version": data.get("hotword_version", 0),
               "error": transport_error, "service_error": service_error}
 elif command in ("send-clipboard", "send-image"):

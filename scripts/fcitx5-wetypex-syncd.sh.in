@@ -48,31 +48,185 @@ try:
     runtime = json.loads(runtime_path.read_text())
 except (OSError, json.JSONDecodeError):
     runtime = {}
+last_group_id = int(runtime.get("group_id", 0))
 last_remote_version = int(runtime.get("remote_version", 0))
-last_outbox_id = str(runtime.get("outbox_id", ""))
-last_image_digest = str(runtime.get("image_digest", ""))
-last_text_digest = str(runtime.get("text_digest", ""))
+last_local_kind = str(runtime.get("local_kind", ""))
+last_local_digest = str(runtime.get("local_digest", ""))
+needs_local_baseline = "local_digest" not in runtime
 once = "--once" in sys.argv
 clipboard_owner = None
 wl_copy = shutil.which("wl-copy") if os.environ.get("WAYLAND_DISPLAY") else None
 wl_paste = shutil.which("wl-paste") if os.environ.get("WAYLAND_DISPLAY") else None
 
+def clipboard_command(arguments, environment):
+    try:
+        return subprocess.run(arguments, capture_output=True, timeout=4,
+                              env=environment)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+def local_clipboard(environment):
+    """Return the one native clipboard item, not independent text/image slots."""
+    if wl_paste:
+        advertised = clipboard_command([wl_paste, "--list-types"], environment)
+        types = (advertised.stdout.decode("utf-8", "replace").splitlines()
+                 if advertised and advertised.returncode == 0 else [])
+        if "image/png" in types:
+            result = clipboard_command(
+                [wl_paste, "--no-newline", "--type", "image/png"],
+                environment)
+            if result and result.returncode == 0 and 0 < len(result.stdout) <= 8388608:
+                return "image", result.stdout, hashlib.sha256(result.stdout).hexdigest()
+        if any(item.startswith("text/") or item in ("UTF8_STRING", "STRING")
+               for item in types):
+            result = clipboard_command([wl_paste, "--no-newline"], environment)
+            if result and result.returncode == 0 and 0 < len(result.stdout) <= 16384:
+                try:
+                    result.stdout.decode("utf-8")
+                except UnicodeDecodeError:
+                    return None
+                return "text", result.stdout, hashlib.sha256(result.stdout).hexdigest()
+        return "empty", b"", hashlib.sha256(b"").hexdigest()
+
+    # A native pasteboard contains one logical item even if it advertises
+    # several representations. Prefer its image representation, like the
+    # original macOS ClipboardMonitor, then fall back to UTF-8 text.
+    image = clipboard_command([clipboard_helper, "--read-image"], environment)
+    if image and image.returncode == 0 and 0 < len(image.stdout) <= 8388608:
+        return "image", image.stdout, hashlib.sha256(image.stdout).hexdigest()
+    text = clipboard_command([clipboard_helper, "--read-text"], environment)
+    if text and text.returncode == 0 and 0 < len(text.stdout) <= 16384:
+        try:
+            text.stdout.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+        return "text", text.stdout, hashlib.sha256(text.stdout).hexdigest()
+    return "empty", b"", hashlib.sha256(b"").hexdigest()
+
+def stop_clipboard_owner():
+    global clipboard_owner
+    if clipboard_owner and clipboard_owner.poll() is None:
+        clipboard_owner.terminate()
+    clipboard_owner = None
+
+def set_remote_clipboard(kind, content, environment):
+    global clipboard_owner
+    stop_clipboard_owner()
+    if wl_copy:
+        mime = "image/png" if kind == "image" else "text/plain;charset=utf-8"
+        try:
+            result = subprocess.run([wl_copy, "--type", mime], input=content,
+                                    timeout=4, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL,
+                                    env=environment)
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        return result.returncode == 0
+    try:
+        arguments = ([clipboard_helper, "--image"] if kind == "image"
+                     else [clipboard_helper])
+        clipboard_owner = subprocess.Popen(
+            arguments, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, env=environment)
+        clipboard_owner.stdin.write(content)
+        clipboard_owner.stdin.close()
+    except (OSError, BrokenPipeError):
+        stop_clipboard_owner()
+        return False
+    return True
+
+# Older releases had a second clipboard producer in the input-method plugin
+# and a persistent inbox consumer. Neither file represents a current user
+# clipboard event, so replaying them after an upgrade would resurrect stale
+# content. The daemon is now the sole owner of synchronization.
+for obsolete in (state_dir / "clipboard-inbox.json",
+                 state_dir / "clipboard-outbox.json"):
+    try:
+        obsolete.unlink()
+    except FileNotFoundError:
+        pass
+
 while True:
-    group = call("group-info")
+    helper_environment = os.environ.copy()
+    helper_environment["QT_IM_MODULE"] = "none"
+    before_fetch = local_clipboard(helper_environment)
+    group = call("group-info", str(last_remote_version))
     if group.get("ok"):
         atomic_json(state_dir / "sync-state.json", group)
         group_id = int(group.get("group_id", 0))
         functions = int(group.get("func_switch", 0))
+        after_fetch = local_clipboard(helper_environment)
+        local = after_fetch if after_fetch is not None else before_fetch
+        local_kind = local[0] if local else ""
+        local_digest = local[2] if local else ""
+        if needs_local_baseline:
+            # Migrate from the old per-format digest state without interpreting
+            # the clipboard present during package upgrade as a fresh copy.
+            last_local_kind = local_kind
+            last_local_digest = local_digest
+            needs_local_baseline = False
+
+        # Clipboard version counters are scoped to a device group. On first
+        # start, re-pairing, or disabled sync, establish a local baseline and
+        # never upload clipboard data that predates that state transition.
+        if group_id != last_group_id:
+            last_group_id = group_id
+            last_remote_version = 0
+            last_local_kind = local_kind
+            last_local_digest = local_digest
+        elif not group_id or not functions & 1:
+            last_local_kind = local_kind
+            last_local_digest = local_digest
         if group_id and functions & 1:
-            helper_environment = os.environ.copy()
-            helper_environment["QT_IM_MODULE"] = "none"
             version = int(group.get("clipboard_version", 0))
             remote = str(group.get("clipboard", ""))
             remote_type = int(group.get("clipboard_type", 0))
             remote_binary = str(group.get("clipboard_binary", ""))
-            received_remote = False
-            if (version > last_remote_version and remote_type in (5, 6, 100) and
-                    remote_binary):
+            from_uin = int(group.get("clipboard_from_uin", 0))
+            self_uin = int(group.get("self_uin", 0))
+            expire_at = int(group.get("clipboard_expire_at", 0))
+            if 0 < expire_at < 100000000000:
+                expire_at *= 1000
+            expired = bool(expire_at and expire_at <= int(time.time() * 1000))
+
+            local_changed = bool(
+                local and (not last_local_digest or
+                           local_kind != last_local_kind or
+                           local_digest != last_local_digest))
+            if local_changed:
+                if local_kind == "empty":
+                    # Empty clipboard is local state, but the service has no
+                    # empty-message type. Remember it so copying the same value
+                    # again is still observed as a new event.
+                    last_local_kind = local_kind
+                    last_local_digest = local_digest
+                    sent = {}
+                elif local_kind == "image":
+                    image_path = state_dir / "clipboard-outbox.png"
+                    temporary = image_path.with_suffix(".png.tmp")
+                    temporary.write_bytes(local[1])
+                    temporary.chmod(0o600)
+                    temporary.replace(image_path)
+                    sent = call("send-image", str(group_id), str(image_path))
+                else:
+                    sent = call("send-clipboard", str(group_id),
+                                local[1].decode("utf-8"))
+                if sent.get("ok"):
+                    # SendClipboardMsgRsp.version is the same monotonic cursor
+                    # advanced by the native clients after a local upload.
+                    last_remote_version = max(
+                        last_remote_version, int(sent.get("version", 0)))
+                    last_local_kind = local_kind
+                    last_local_digest = local_digest
+            elif version > last_remote_version and expired:
+                last_remote_version = version
+            elif (version > last_remote_version and from_uin and self_uin and
+                  from_uin == self_uin):
+                # A response can race the upload acknowledgement. Advance the
+                # cursor, but never paste our own clipboard back over the user.
+                last_remote_version = version
+            elif (version > last_remote_version and
+                  remote_type in (5, 6, 100) and remote_binary):
                 try:
                     image = base64.b64decode(remote_binary, validate=True)
                 except (ValueError, base64.binascii.Error):
@@ -86,100 +240,26 @@ while True:
                         image = b""
                     else:
                         image = normalized.stdout
-                if image:
-                    if wl_copy:
-                        subprocess.run([wl_copy, "--type", "image/png"],
-                                       input=image, timeout=4,
-                                       stdout=subprocess.DEVNULL,
-                                       stderr=subprocess.DEVNULL,
-                                       env=helper_environment)
-                    else:
-                        if clipboard_owner and clipboard_owner.poll() is None:
-                            clipboard_owner.terminate()
-                        clipboard_owner = subprocess.Popen(
-                            [clipboard_helper, "--image"], stdin=subprocess.PIPE,
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                            env=helper_environment)
-                        clipboard_owner.stdin.write(image)
-                        clipboard_owner.stdin.close()
-                    last_image_digest = hashlib.sha256(image).hexdigest()
+                if image and set_remote_clipboard("image", image,
+                                                  helper_environment):
+                    last_local_kind = "image"
+                    last_local_digest = hashlib.sha256(image).hexdigest()
                     last_remote_version = version
-                    received_remote = True
             elif version > last_remote_version and remote:
-                atomic_json(state_dir / "clipboard-inbox.json",
-                            {"version": version, "text": remote})
-                if clipboard_owner and clipboard_owner.poll() is None:
-                    clipboard_owner.terminate()
-                clipboard_owner = subprocess.Popen(
-                    [clipboard_helper], stdin=subprocess.PIPE,
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    env=helper_environment)
-                clipboard_owner.stdin.write(remote.encode())
-                clipboard_owner.stdin.close()
-                last_text_digest = hashlib.sha256(remote.encode()).hexdigest()
+                encoded = remote.encode("utf-8")
+                if (len(encoded) <= 16384 and
+                        set_remote_clipboard("text", encoded,
+                                             helper_environment)):
+                    last_local_kind = "text"
+                    last_local_digest = hashlib.sha256(encoded).hexdigest()
+                    last_remote_version = version
+            elif version > last_remote_version:
+                # Do not retry malformed or unsupported messages forever.
                 last_remote_version = version
-                received_remote = True
-
-            outbox_path = state_dir / "clipboard-outbox.json"
-            try:
-                outbox = json.loads(outbox_path.read_text())
-            except (OSError, json.JSONDecodeError):
-                outbox = {}
-            outbox_id = str(outbox.get("id", ""))
-            text = str(outbox.get("text", ""))
-            if received_remote and outbox_id:
-                last_outbox_id = outbox_id
-            elif outbox_id and outbox_id != last_outbox_id and text:
-                sent = call("send-clipboard", str(group_id), text)
-                if sent.get("ok"):
-                    last_outbox_id = outbox_id
-                    last_text_digest = hashlib.sha256(text.encode()).hexdigest()
-            if not received_remote:
-                try:
-                    local_text = subprocess.run(
-                        ([wl_paste, "--no-newline"]
-                         if wl_paste else [clipboard_helper, "--read-text"]),
-                        capture_output=True, timeout=4, env=helper_environment)
-                except subprocess.TimeoutExpired:
-                    local_text = None
-                if (local_text and local_text.returncode == 0 and
-                        0 < len(local_text.stdout) <= 16384):
-                    try:
-                        clipboard_text = local_text.stdout.decode("utf-8")
-                    except UnicodeDecodeError:
-                        clipboard_text = ""
-                    digest = hashlib.sha256(local_text.stdout).hexdigest()
-                    if not last_text_digest:
-                        # Enabling sync does not upload unrelated clipboard data
-                        # that predates the setting. Changes after this baseline do.
-                        last_text_digest = digest
-                    elif clipboard_text and digest != last_text_digest:
-                        sent = call("send-clipboard", str(group_id), clipboard_text)
-                        if sent.get("ok"):
-                            last_text_digest = digest
-                try:
-                    local_image = subprocess.run(
-                        ([wl_paste, "--no-newline", "--type", "image/png"]
-                         if wl_paste else [clipboard_helper, "--read-image"]),
-                        capture_output=True, timeout=4, env=helper_environment)
-                except subprocess.TimeoutExpired:
-                    local_image = None
-                if (local_image and local_image.returncode == 0 and
-                        0 < len(local_image.stdout) <= 8388608):
-                    digest = hashlib.sha256(local_image.stdout).hexdigest()
-                    if digest != last_image_digest:
-                        image_path = state_dir / "clipboard-outbox.png"
-                        temporary = image_path.with_suffix(".png.tmp")
-                        temporary.write_bytes(local_image.stdout)
-                        temporary.chmod(0o600)
-                        temporary.replace(image_path)
-                        sent = call("send-image", str(group_id), str(image_path))
-                        if sent.get("ok"):
-                            last_image_digest = digest
-            atomic_json(runtime_path, {"remote_version": last_remote_version,
-                                       "outbox_id": last_outbox_id,
-                                       "image_digest": last_image_digest,
-                                       "text_digest": last_text_digest})
+        atomic_json(runtime_path, {"group_id": last_group_id,
+                                   "remote_version": last_remote_version,
+                                   "local_kind": last_local_kind,
+                                   "local_digest": last_local_digest})
     if once:
         break
     time.sleep(3 if group.get("ok") else 10)

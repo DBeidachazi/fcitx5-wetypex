@@ -41,6 +41,8 @@ makepkg -C -f --noconfirm
 - `CMakeLists.txt` 的 `project(... VERSION ...)`。
 - `packaging/PKGBUILD.in` 的 `pkgver`。
 - `tools/package_release.py` 的 `version`。
+- 发布修订时同步更新 `packaging/PKGBUILD.in`、AUR `PKGBUILD` 的
+  `pkgrel` 与 `packaging/nfpm.yaml` 的 `release`。
 - README 安装示例。
 
 ## 安装布局
@@ -59,4 +61,4 @@ makepkg -C -f --noconfirm
 
 ## GitHub Release
 
-推送与 `CMakeLists.txt` 版本一致的 `vX.Y.Z` 标签会触发发布工作流。工作流分别在 Arch Linux、Debian Trixie 和 Fedora 43 环境构建软件包，生成源码包、便携归档与 SHA-256 校验文件，并创建或更新同名 GitHub Release。标签与源码版本不一致时，工作流会直接失败。
+推送由 `CMakeLists.txt` 版本和软件包修订号组成的 `vX.Y.Z-N` 标签会触发发布工作流。工作流分别在 Arch Linux、Debian Trixie 和 Fedora 43 环境构建软件包，生成源码包、便携归档与 SHA-256 校验文件，并创建或更新同名 GitHub Release。标签与源码版本或修订号不一致时，工作流会直接失败。

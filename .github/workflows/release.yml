@@ -34,7 +34,8 @@ jobs:
         shell: bash
         run: |
           version=$(sed -n 's/^project([^ ]* VERSION \([^ ]*\).*/\1/p' CMakeLists.txt)
-          test "v${version}" = "${RELEASE_TAG}"
+          pkgrel=$(sed -n 's/^pkgrel=//p' packaging/PKGBUILD.in)
+          test "v${version}-${pkgrel}" = "${RELEASE_TAG}"
 
       - name: 安装发布工具
         run: sudo apt-get update && sudo apt-get install -y zstd
@@ -163,8 +164,10 @@ jobs:
               cp "$1/packaging/aur/PKGBUILD" \
                  "$1/packaging/aur/fcitx5-wetypex.install" "$HOME/aur/"
               cd "$HOME/aur"
-              version="${RELEASE_TAG#v}"
+              version=$(sed -n "s/^project([^ ]* VERSION \([^ ]*\).*/\1/p" "$1/CMakeLists.txt")
+              pkgrel=$(sed -n "s/^pkgrel=//p" "$1/packaging/PKGBUILD.in")
               sed -i "s/^pkgver=.*/pkgver=$version/" PKGBUILD
+              sed -i "s/^pkgrel=.*/pkgrel=$pkgrel/" PKGBUILD
               source_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/fcitx5-wetypex-${version}.tar.gz"
               digest="$(curl -fsSL "$source_url" | sha256sum | cut -d" " -f1)"
               sed -i "s/^sha256sums=.*/sha256sums=(\"$digest\" \"SKIP\")/" PKGBUILD
@@ -176,6 +179,6 @@ jobs:
                 echo "AUR metadata is already current"
                 exit 0
               fi
-              git commit -m "fcitx5-wetypex $version"
+              git commit -m "fcitx5-wetypex $version-$pkgrel"
               git push
             ' _ "$GITHUB_WORKSPACE"

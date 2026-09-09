@@ -547,6 +547,12 @@ static void business_service() {
       protobuf_string(request, 3, getenv("WETYPE_CONFIRM_BIND_ID"));
     } else if (operation_subcommand == 34) {
       protobuf_uint(request, 3, 31); // devices, clipboard, hotwords and dict
+      // GetGroupInfoReq.current_clipboard_version.  Both native desktop
+      // clients send their last accepted version as the synchronization
+      // cursor. The client still compares the response because the service
+      // may include the current payload again.
+      protobuf_uint(request, 4,
+                    strtoull(getenv("WETYPE_GROUP_INFO"), nullptr, 10));
     } else if (operation_subcommand == 35) {
       protobuf_uint(request, 3,
                     strtoull(getenv("WETYPE_UNBIND_UIN"), nullptr, 10));
@@ -837,7 +843,8 @@ static void business_service() {
   std::vector<unsigned char> group;
   uint64_t response_func_switch = 0, response_clipboard_version = 0,
            response_hotword_version = 0;
-  uint64_t response_clipboard_type = 0;
+  uint64_t response_clipboard_type = 0, response_clipboard_expire_at = 0,
+           response_clipboard_expiration = 0, response_clipboard_from_uin = 0;
   std::string response_clipboard_binary;
   std::string response_clipboard;
   auto devices = wire::Json(json_object_new_array());
@@ -857,7 +864,11 @@ static void business_service() {
         response_clipboard_version = protobuf_uint_field(clips.front(), 1, 0);
         response_clipboard_type = protobuf_uint_field(clips.front(), 2, 0);
         response_clipboard = protobuf_string_field(clips.front(), 3);
+        response_clipboard_expire_at = protobuf_uint_field(clips.front(), 4, 0);
+        response_clipboard_expiration =
+            protobuf_uint_field(clips.front(), 5, 0);
         response_clipboard_binary = protobuf_string_field(clips.front(), 6);
+        response_clipboard_from_uin = protobuf_uint_field(clips.front(), 7, 0);
         if (response_clipboard.empty() && response_clipboard_type == 1)
           response_clipboard = response_clipboard_binary;
       }
@@ -984,6 +995,12 @@ static void business_service() {
   wire::put(report.get(), "hotword_version", int64_t(response_hotword_version));
   wire::put(report.get(), "clipboard", response_clipboard);
   wire::put(report.get(), "clipboard_type", int64_t(response_clipboard_type));
+  wire::put(report.get(), "clipboard_expire_at",
+            int64_t(response_clipboard_expire_at));
+  wire::put(report.get(), "clipboard_expiration",
+            int64_t(response_clipboard_expiration));
+  wire::put(report.get(), "clipboard_from_uin",
+            int64_t(response_clipboard_from_uin));
   wire::put(report.get(), "clipboard_binary",
             !response_clipboard_binary.empty()
                 ? base64_encode(response_clipboard_binary)

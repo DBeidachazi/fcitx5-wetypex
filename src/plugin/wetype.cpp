@@ -15,6 +15,7 @@
 #include <fcitx/addonmanager.h>
 #include <fcitx/candidatelist.h>
 #include <fcitx/event.h>
+#include <fcitx/globalconfig.h>
 #include <fcitx/inputcontext.h>
 #include <fcitx/inputcontextmanager.h>
 #include <fcitx/inputcontextproperty.h>
@@ -185,6 +186,7 @@ class WeType;
 struct State : InputContextProperty {
   uint64_t id, epoch = 1, seq = 0, applied = 0, revision = 0;
   uint64_t cloudPollUntil = 0, lastCloudPoll = 0;
+  int candidatePage = 0, candidateCursor = 0;
   std::string preedit;
   size_t cursor = 0;
   std::string displayPreedit;
@@ -232,11 +234,10 @@ class WeType : public InputMethodEngine {
   uint64_t activity_ = 0;
   uint64_t restartAt_ = 0, restartBackoff_ = 250000;
   bool restartNeedsOpen_ = false;
-  uint64_t syncTick_ = 0, updateTick_ = 0, lastInboxVersion_ = 0;
+  uint64_t syncTick_ = 0, updateTick_ = 0;
   uint64_t lastVoiceVersion_ = 0;
   uint64_t lastVModeVersion_ = 0;
   std::string inbound_, outbound_;
-  std::string lastLocalClipboard_, lastRemoteClipboard_;
   bool voiceRecording_ = false, voiceHold_ = false;
   pid_t syncChild_ = -1;
   void startSync() {
@@ -808,43 +809,6 @@ class WeType : public InputMethodEngine {
       chmod(temporary.c_str(), 0600);
       std::filesystem::rename(temporary, path, error);
     }
-    if (!networkEnabled_ || value == lastLocalClipboard_ ||
-        value == lastRemoteClipboard_)
-      return;
-    lastLocalClipboard_ = value;
-    auto outbox = wire::object();
-    wire::put(outbox.get(), "id",
-              std::to_string(now(CLOCK_REALTIME)) + "-" +
-                  std::to_string(getpid()));
-    wire::put(outbox.get(), "text", value);
-    auto path = directory / "clipboard-outbox.json";
-    auto temporary = path;
-    temporary += ".tmp";
-    std::ofstream outgoing(temporary, std::ios::trunc);
-    outgoing << wire::dump(outbox.get()) << '\n';
-    outgoing.close();
-    chmod(temporary.c_str(), 0600);
-    std::filesystem::rename(temporary, path, error);
-  }
-  void receiveRemoteClipboard() {
-    auto path = stateDirectory() / "clipboard-inbox.json";
-    std::ifstream input(path);
-    std::string bytes((std::istreambuf_iterator<char>(input)), {});
-    if (bytes.empty() || bytes.size() > 65536)
-      return;
-    auto message = wire::parse(bytes);
-    auto version = uint64_t(wire::number(message.get(), "version"));
-    auto text = wire::str(message.get(), "text");
-    if (!version || version <= lastInboxVersion_ || text.empty() ||
-        text.size() > 16384)
-      return;
-    auto *addon = instance_->addonManager().addon("clipboard", true);
-    if (!addon)
-      return;
-    addon->call<IClipboard::setClipboard>("WeTypeX 跨设备", text);
-    lastInboxVersion_ = version;
-    lastRemoteClipboard_ = text;
-    lastLocalClipboard_ = text;
   }
   void startVoice(InputContext *ic, bool hold) {
     if (voiceRecording_)
@@ -1089,6 +1053,12 @@ class WeType : public InputMethodEngine {
             int index = 0, int64_t revision = -1, int64_t cursor = -1,
             const std::string &mapped = {}, int pairCursor = -1) {
     auto *s = state(ic);
+    // Candidate page/cursor state belongs to the current composition.
+    // Cloud-result polls refresh that same list and must preserve the user's
+    // position; every actual engine operation starts again from the first
+    // candidate, as on the native Windows/macOS clients.
+    if (std::string_view(op) != "poll")
+      s->candidatePage = s->candidateCursor = 0;
     if (child_ <= 0 && !start()) {
       failed_ = true;
       scheduleRestart();
@@ -1240,6 +1210,7 @@ class WeType : public InputMethodEngine {
     s->revision = wire::number(j.get(), "revision");
     auto list = std::make_unique<CommonCandidateList>();
     list->setPageSize(pageSize_);
+    list->setCursorPositionAfterPaging(CursorPositionAfterPaging::ResetToFirst);
     // The Windows candidate bar renders the page-local digit as part of each
     // candidate ("1测试"), without Fcitx's default "1. 测试" label.
     list->setSelectionKey({});
@@ -1258,7 +1229,14 @@ class WeType : public InputMethodEngine {
         }
       }
     if (list->totalSize()) {
-      list->setGlobalCursorIndex(0);
+      s->candidatePage =
+          std::clamp(s->candidatePage, 0, std::max(0, list->totalPages() - 1));
+      const int pageBegin = s->candidatePage * pageSize_;
+      const int pageEnd = std::min(pageBegin + pageSize_, list->totalSize());
+      s->candidateCursor = std::clamp(s->candidateCursor, pageBegin,
+                                      std::max(pageBegin, pageEnd - 1));
+      list->setPage(s->candidatePage);
+      list->setGlobalCursorIndex(s->candidateCursor);
       ic->inputPanel().setCandidateList(std::move(list));
     } else
       ic->inputPanel().setCandidateList(nullptr);
@@ -1305,7 +1283,6 @@ public:
           }
           if (time >= syncTick_ + 1000000) {
             syncTick_ = time;
-            receiveRemoteClipboard();
             receiveVoice();
             receiveVModeAction();
           }
@@ -1447,7 +1424,11 @@ public:
         const bool third =
             sym == FcitxKey_Control_R ||
             releasedConfiguredKey(*config_.shortcuts->thirdCandidateKeys);
-        select(ic, third ? 2 : 1);
+        auto *list = dynamic_cast<CommonCandidateList *>(
+            ic->inputPanel().candidateList().get());
+        const unsigned pageIndex = third ? 2 : 1;
+        if (list && pageIndex < unsigned(list->size()))
+          list->candidate(pageIndex).select(ic);
         s->modifierCandidate = FcitxKey_None;
         e.filterAndAccept();
         return;
@@ -1620,9 +1601,7 @@ public:
     if (s->vMode && sym >= 0x20 && sym <= 0x7e) {
       if (sym == FcitxKey_space) {
         if (list && list->totalSize())
-          select(ic, list->globalCursorIndex() >= 0
-                         ? unsigned(list->globalCursorIndex())
-                         : 0);
+          list->candidate(std::max(list->cursorIndex(), 0)).select(ic);
         e.filterAndAccept();
         return;
       }
@@ -1672,17 +1651,9 @@ public:
       e.filterAndAccept();
       return;
     }
-    if (composing && list && (sym == FcitxKey_Up || sym == FcitxKey_Down)) {
-      if (sym == FcitxKey_Up)
-        list->prevCandidate();
-      else
-        list->nextCandidate();
-      ic->updateUserInterface(UserInterfaceComponent::InputPanel);
-      e.filterAndAccept();
-      return;
-    }
     bool pageDown =
         sym == FcitxKey_Page_Down ||
+        key.checkKeyList(instance_->globalConfig().defaultNextPage()) ||
         key.checkKeyList(*config_.shortcuts->nextPageKeys) ||
         (*config_.shortcuts->pageMinusEqual && sym == FcitxKey_equal) ||
         (*config_.shortcuts->pageBrackets && sym == FcitxKey_bracketright) ||
@@ -1691,6 +1662,7 @@ public:
          !key.states().test(KeyState::Shift) && sym == FcitxKey_Tab);
     bool pageUp =
         sym == FcitxKey_Page_Up ||
+        key.checkKeyList(instance_->globalConfig().defaultPrevPage()) ||
         key.checkKeyList(*config_.shortcuts->previousPageKeys) ||
         (*config_.shortcuts->pageMinusEqual && sym == FcitxKey_minus) ||
         (*config_.shortcuts->pageBrackets && sym == FcitxKey_bracketleft) ||
@@ -1704,8 +1676,27 @@ public:
             list->next();
         } else if (list->hasPrev())
           list->prev();
+        s->candidatePage = list->currentPage();
+        s->candidateCursor = list->globalCursorIndex();
         ic->updateUserInterface(UserInterfaceComponent::InputPanel);
       }
+      e.filterAndAccept();
+      return;
+    }
+    const bool previousCandidate =
+        key.checkKeyList(instance_->globalConfig().defaultPrevCandidate()) ||
+        sym == FcitxKey_Up;
+    const bool nextCandidate =
+        key.checkKeyList(instance_->globalConfig().defaultNextCandidate()) ||
+        sym == FcitxKey_Down;
+    if (composing && list && (previousCandidate || nextCandidate)) {
+      if (previousCandidate)
+        list->prevCandidate();
+      else
+        list->nextCandidate();
+      s->candidatePage = list->currentPage();
+      s->candidateCursor = list->globalCursorIndex();
+      ic->updateUserInterface(UserInterfaceComponent::InputPanel);
       e.filterAndAccept();
       return;
     }
@@ -1717,7 +1708,10 @@ public:
         (configuredSecond || configuredThird ||
          (*config_.shortcuts->selectSemicolonQuote &&
           (sym == FcitxKey_semicolon || sym == FcitxKey_apostrophe)))) {
-      select(ic, configuredSecond || sym == FcitxKey_semicolon ? 1 : 2);
+      const unsigned pageIndex =
+          configuredSecond || sym == FcitxKey_semicolon ? 1 : 2;
+      if (list && pageIndex < unsigned(list->size()))
+        list->candidate(pageIndex).select(ic);
       e.filterAndAccept();
       return;
     }
@@ -1729,12 +1723,15 @@ public:
         if (sym != FcitxKey_space)
           return;
       }
-      unsigned index =
-          sym == FcitxKey_space && list && list->globalCursorIndex() >= 0
-              ? unsigned(list->globalCursorIndex())
-              : unsigned((list ? list->currentPage() * pageSize_ : 0) +
-                         pageIndex);
-      select(ic, index);
+      if (list && list->size()) {
+        const int index = sym == FcitxKey_space
+                              ? std::max(list->cursorIndex(), 0)
+                              : int(pageIndex);
+        if (index < list->size())
+          list->candidate(index).select(ic);
+      } else if (sym == FcitxKey_space) {
+        select(ic, 0);
+      }
       e.filterAndAccept();
       return;
     }
@@ -1770,9 +1767,7 @@ public:
     if (composing && (sym == FcitxKey_Escape || sym == FcitxKey_Return ||
                       sym == FcitxKey_KP_Enter)) {
       if (s->vMode && sym != FcitxKey_Escape && list && list->totalSize()) {
-        select(ic, list->globalCursorIndex() >= 0
-                       ? unsigned(list->globalCursorIndex())
-                       : 0);
+        list->candidate(std::max(list->cursorIndex(), 0)).select(ic);
         e.filterAndAccept();
         return;
       }
